@@ -1,0 +1,15 @@
+Fuji Bridge copies photos from your Fujifilm camera to your Mac, iPhone or iPad, quickly and without surprises.
+
+• Import in one click: the newest 25, the newest 100, or the whole card. Photos you already have are skipped.
+• USB or Wi-Fi: plug in the cable for the fastest copy (over 20 MB/s measured with an X100VI), or go wireless.
+• Wakes the camera over Bluetooth: once paired, Fuji Bridge asks the camera to turn on its Wi-Fi and shows you the network to join.
+• Preview before importing: browse the card, pick the frames you want, and look at any of them at full size.
+• Resumes where it stopped: a dropped connection picks up from the last byte instead of starting the file over.
+• A calm library: a justified grid that makes room for the pictures, and a full-screen viewer with arrow keys, Space and zoom.
+• Diagnostics you can read: every import keeps a report with the time each step took, the speed of each file, and what went wrong if something did. Share it in one click.
+
+Your photos stay on your Mac, in Pictures › Fuji Bridge (and in Files › Fuji Bridge on iPhone and iPad). No account, no tracking, no data collected.
+
+Tested with the Fujifilm X100VI. Other recent Fujifilm cameras with USB or smartphone Wi-Fi transfer may work too.
+
+Fuji Bridge is an independent app. It is not affiliated with or endorsed by FUJIFILM Corporation. Fujifilm and X100VI are trademarks of their respective owners.

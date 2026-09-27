@@ -1,0 +1,1 @@
+fujifilm,x100vi,x100v,camera,import,transfer,photo,wifi,usb,bluetooth,sync,jpeg,xt5,xs20,tether

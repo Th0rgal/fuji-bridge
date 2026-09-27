@@ -41,6 +41,6 @@ xcodegen generate
 open FujiBridge.xcodeproj   # set your team, then Run
 ```
 
-Notes on the protocol, the tests and the camera's quirks: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+Notes on the protocol, the tests and the camera's quirks: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). Store assets: [docs/STORE.md](docs/STORE.md).
 
 <sub>MIT licensed. Not affiliated with FUJIFILM Corporation.</sub>

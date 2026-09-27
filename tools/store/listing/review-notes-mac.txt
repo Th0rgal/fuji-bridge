@@ -1,0 +1,13 @@
+Fuji Bridge imports photos from a Fujifilm camera (tested with the X100VI) over USB, or over the camera's own Wi-Fi network, which the app can ask the camera to turn on through Bluetooth.
+
+The app needs a Fujifilm camera to import anything; it has no account and no sign-in. Without a camera, you can still open the Imported tab, the photo viewer, and Diagnostics (bottom of the sidebar), and the camera card explains how to connect.
+
+To test with a camera:
+1. USB: plug the camera into the Mac with a USB-C cable, then click Import.
+2. Wireless: click the Bluetooth button on the camera card, pair from the camera (Bluetooth › Pairing Registration), then click Import. The camera starts its Wi-Fi; the app shows the network name and waits while you join it from the Wi-Fi menu.
+
+Entitlements: App Sandbox with outgoing network (the camera at 192.168.0.1), Bluetooth (find the camera and wake its Wi-Fi), and Pictures read-write (photos are saved to Pictures › Fuji Bridge).
+
+The screenshots and previews show real captures of the app: imports run against a staged card with the same protocol as the camera.
+
+Contact: thomas.marchand@tuta.io
