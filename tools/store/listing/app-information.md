@@ -10,7 +10,7 @@
 | Age rating | 4+ (every questionnaire answer "No"/"None", no override) |
 | Privacy policy | https://veritylabs.dev/privacy |
 | App Privacy | Data Not Collected (published) |
-| Price | €2.99, base country Portugal, all 175 countries |
+| Price | €4.99, base country Portugal, all 175 countries |
 | Apple silicon Macs (iPad app) | Unchecked: the Mac gets the Catalyst build |
 | Support URL | https://github.com/Th0rgal/fuji-bridge |
 | Copyright | 2026 Thomas Marchand |

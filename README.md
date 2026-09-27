@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://apps.apple.com/app/id6816612097"><b>App Store</b></a> · €2.99
+  <a href="https://apps.apple.com/app/id6816612097"><b>App Store</b></a> · €4.99
 </p>
 
 <br>
@@ -29,11 +29,13 @@
 
 <br>
 
-Preview the card, keep what you pick, and see what happened when a transfer is slow. Tested with the X100VI.
+I love my Fujifilm X100VI. I didn't love the app that comes with it: imports stuck on a spinner, a Wi-Fi link that drops without saying why, and no way to know what went wrong. So I made my own.
+
+It copies over the cable or over Wi-Fi, lets me look at the card before copying anything, and when a transfer is slow, it tells me why. I use it with the X100VI; other recent Fujifilm bodies should work too.
 
 **Private.** No account, no analytics, no server. The app talks to your camera and nothing else. Photos stay in Files › Fuji Bridge, or Pictures › Fuji Bridge on the Mac.
 
-**Open source.** The App Store version is how you support the work. If you'd rather not, build it yourself, it's the same app:
+**Open source.** Buying it on the App Store is how you can support me. If you'd rather not, that's fine: build it yourself, it's the same app:
 
 ```sh
 brew install xcodegen
