@@ -20,6 +20,15 @@ Fuji Bridge, compared with the way that session usually dies:
 - gives each read 30 s once files are moving (XApp's GET_OBJECT_TIMEOUT), so a slow window is not cut and asked again
 - reads `GetPartialObject` (`0x101B`) in 1 MB pieces and resumes from the last offset. `compressed_size` is the unaligned word at offset 13. The filename is a PTP string at offset 52 (length byte, then UTF-16), not raw ASCII.
 
+## Wi-Fi reliability and what the report measures
+
+- **Streaming and resume.** Each file is written as it arrives to a hidden `.<name>.<size>.part` next to the photo, then moved into place. A run that dies (Wi-Fi lost, app suspended, camera off) keeps what it got, and the next import asks the camera only for the rest, from a 512-byte boundary. The size in the name keeps a resized copy and an original apart.
+- **Reconnects.** A dead window reopens the session up to four times (0, 1, 2, 4 s apart). Before each retry the app checks the phone still has an address on the camera's network and joins it again if iOS fell back to the home Wi-Fi. A file is given up only after five stalls in a row with no window getting through.
+- **Leaving the screen.** iOS will not join a network for a background app. The join waits for the app to come back, and an import cut short by leaving the screen starts again (as a resume) when it does, within 10 minutes.
+- **Per window.** Every GetPartialObject line records the first-byte latency (the camera) and, over TCP, how many receives the window came in and the longest silence once bytes were flowing (the radio).
+- **TRANSFER** in the report: wire vs effective MB/s, per-window p10/p50/p90, first byte and silence percentiles, reconnects and their cost, bytes asked twice, bytes resumed from disk, and MB/s per 5 s slice. The same numbers are in the JSON (`transfer`).
+- **Speed test** (Diagnostics): reads the newest photo with 256 KB, 512 KB, 1 MB, 2 MB and 4 MB windows, up to 8 MB each, saves nothing, and switches imports to the fastest window if it beats the current one by 10%. "Back to 1 MB" undoes it.
+
 ## Two modes
 
 **Virtual body.** A body in the process. Turn on the stalls (flaky init, OK prompt, mid-file TCP death, 100 KB size lie, skipped settle) and replay XApp next to Fuji Bridge. Compare runs each fault alone.

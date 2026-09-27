@@ -5,6 +5,8 @@ enum Fuji {
     static let port: UInt16 = 55740
     static let version: UInt32 = 0x8f53e4f2
     static let partialMax = 0x0010_0000
+    /// Largest window the speed test tries.
+    static let windowMax = 0x0080_0000
     static let stallBytes = 64 * 1024
     static let liedSize = 102_400
 
@@ -214,11 +216,24 @@ protocol ByteLink: AnyObject, Sendable {
     func observe(_ sink: @escaping @Sendable (String, String) -> Void)
     /// How long a read may wait for the next byte before the link gives up.
     func setReadTimeout(_ seconds: TimeInterval)
+    /// Starts counting receives for one window (a GetPartialObject), after its command went out.
+    func markWindow()
+    /// What the socket saw since `markWindow`: nil on links that hand a window over in one piece (USB, virtual).
+    func windowStats() -> WindowStats?
 }
 
 extension ByteLink {
     func observe(_ sink: @escaping @Sendable (String, String) -> Void) {}
     func setReadTimeout(_ seconds: TimeInterval) {}
+    func markWindow() {}
+    func windowStats() -> WindowStats? { nil }
+}
+
+/// How the bytes of one window trickled in. A long silence after the first byte is the radio, not the camera.
+struct WindowStats: Sendable, Equatable {
+    var receives: Int
+    /// Longest wait between two receives after the first byte, in ms.
+    var longestGapMs: Double
 }
 
 /// Packed `PtpFujiEvents`: u16 count, then {u16 code, u32 value}. DF00 is not always first.

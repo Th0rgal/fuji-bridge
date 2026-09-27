@@ -22,6 +22,10 @@ struct TraceLine: Identifiable, Equatable, Sendable, Codable {
     var file: String = ""
     /// Partial reads only: command sent to the first byte of the data phase. The body's own latency.
     var firstByte: Double? = nil
+    /// Partial reads over TCP only: the longest silence between two receives once bytes were flowing. The radio.
+    var gap: Double? = nil
+    /// Partial reads over TCP only: how many receives the window arrived in.
+    var receives: Int? = nil
 }
 
 struct FileResult: Equatable, Sendable, Codable {
@@ -148,6 +152,13 @@ struct RunOptions: Sendable {
     var transferTimeout: TimeInterval? = nil
     /// Copies only, over Wi-Fi: have the body resize each JPEG before sending it.
     var size: ImportSize = .original
+    /// Bytes asked per GetPartialObject. XApp uses 1 MB; the speed test measures others.
+    var window: Int = Fuji.partialMax
+    /// Called between reconnect attempts: puts the device back on the camera's network if it fell off.
+    /// True when it is on it.
+    var rejoin: (@Sendable () async -> Bool)? = nil
+    /// Speed test instead of an import: read the newest frame once per window size, save nothing.
+    var benchmark: [Int]? = nil
 }
 
 enum Importer {
@@ -236,6 +247,100 @@ enum Importer {
             return await delete(queue: queue, files: files, io: io, link: link, options: options)
         }
         return await copy(queue: queue, files: files, io: io, link: link, options: options)
+    }
+
+    /// The speed test: the newest frame, read from the start once per window size, up to 8 MB each, nothing saved.
+    /// Each size gets a "bench-total" line with its throughput, so the report can compare them.
+    private static func bench(sizes: [Int], queue: [CardFrame], files: [FileResult], io: IO, link: ByteLink, options: RunOptions, fujiProps: Bool) async -> RunResult {
+        var files = files
+        guard let frame = queue.first else {
+            await link.close()
+            return RunResult(ok: false, reason: "empty", summary: "No photo on the card to test with.", files: files)
+        }
+        io.file = frame.name
+        var total = 0
+        if fujiProps, let size = await io.objectSize(frame.handle), size > 0 { total = size }
+        if total == 0, let info = try? await io.getData(Fuji.getObjectInfo, params: [UInt32(frame.handle)], title: "GetObjectInfo #\(frame.handle)", op: "prep") {
+            total = (options.transport == .usb ? ObjectInfo.standardSize(info) : ObjectInfo.compressedSize(info)) ?? 0
+        }
+        guard total > 0 else {
+            await link.close()
+            return RunResult(ok: false, reason: "object-info", summary: "The camera did not say how big its newest photo is.", files: files)
+        }
+        let span = min(total, 8 * 1_048_576)
+        io.note("Speed test", "Reading the first \(ByteFormat.string(span)) of handle \(frame.handle) (\(ByteFormat.string(total))) with \(sizes.map { ByteFormat.string($0) }.joined(separator: ", ")) windows.", op: "bench")
+        var results: [String] = []
+        for (round, size) in sizes.enumerated() {
+            if options.control.aborted || Task.isCancelled { return await stop(files, io) }
+            options.progress?(LiveProgress(index: round, count: sizes.count, name: "\(ByteFormat.string(size)) windows", got: 0, total: span, bytesPerSecond: 0, copiedBytes: 0))
+            var offset = 0
+            var failed = false
+            let start = io.now()
+            while offset < span {
+                let exchange = await io.partial(handle: frame.handle, offset: offset, ask: min(size, span - offset), name: "\(ByteFormat.string(size)) windows", op: "bench")
+                guard exchange.completed, accepted(exchange.response), exchange.bytes > 0 else {
+                    failed = true
+                    if !exchange.completed {
+                        await link.close()
+                        if let error = await reconnect(io: io, link: link, options: options, resume: "the speed test") {
+                            await link.close()
+                            return RunResult(ok: false, reason: "link", summary: "Reconnect failed during the speed test. \(IO.describe(error))", files: files)
+                        }
+                    }
+                    break
+                }
+                offset += exchange.bytes
+                // Keep the next read on a 512-byte boundary, as the importer does.
+                offset -= Importer.misalignment(offset: offset, total: total)
+                let seconds = max(0.001, (io.now() - start) / 1000)
+                options.progress?(LiveProgress(index: round, count: sizes.count, name: "\(ByteFormat.string(size)) windows", got: offset, total: span, bytesPerSecond: Double(offset) / seconds, copiedBytes: offset))
+            }
+            let took = io.now() - start
+            let rate = ByteFormat.rate(Double(offset), ms: took)
+            results.append("\(ByteFormat.string(size)): \(failed ? "failed" : rate)")
+            if failed {
+                io.fail("Window \(ByteFormat.string(size))", "Refused or cut after \(ByteFormat.string(offset)).", op: "bench-total", took: took, bytes: offset)
+            } else {
+                io.ok("Window \(ByteFormat.string(size))", "\(ByteFormat.string(offset)) in \(IO.ms(took)), \(rate).", op: "bench-total", took: took, bytes: offset)
+            }
+        }
+        io.file = ""
+        if fujiProps {
+            _ = try? await io.setProp(Fuji.compressSmall, value: LE.data16(0), title: "Set D226 = 0", op: "prep")
+        }
+        await link.close()
+        let summary = "Speed test: " + results.joined(separator: " · ")
+        io.ok("Speed test done", summary, op: "done", took: io.now())
+        files = files.map { var f = $0; f.state = f.handle == frame.handle ? "tested" : "skipped"; return f }
+        return RunResult(ok: true, reason: "benchmarked", summary: summary, files: files)
+    }
+
+    /// Re-opens the session after a stall: a few attempts with a growing pause, and before each retry a chance
+    /// for the app to put the phone back on the camera's Wi-Fi if it fell off it. Nil when the link is back.
+    private static func reconnect(io: IO, link: ByteLink, options: RunOptions, resume: String) async -> Error? {
+        let pauses: [UInt64] = [0, 1, 2, 4]
+        var last: Error = LinkError.closed
+        for (attempt, pause) in pauses.enumerated() {
+            if options.control.aborted || Task.isCancelled { return LinkError.closed }
+            if pause > 0 {
+                if let rejoin = options.rejoin {
+                    let back = await rejoin()
+                    io.note("Wi-Fi check", back ? "This device is on the camera's network." : "This device is not on the camera's network, and joining it again did not work.", op: "reconnect")
+                }
+                try? await Task.sleep(nanoseconds: pause * 1_000_000_000)
+            }
+            let start = io.now()
+            do {
+                try await io.reopen(settle: options.paceNanos > 0 || options.live)
+                io.ok("Reconnected", "Resuming \(resume)\(attempt > 0 ? " on attempt \(attempt + 1)" : "").", op: "reconnect-total", took: io.now() - start)
+                return nil
+            } catch {
+                last = error
+                io.fail("Reconnect failed", "Attempt \(attempt + 1) of \(pauses.count). \(IO.describe(error))", op: "reconnect-total", took: io.now() - start)
+                await link.close()
+            }
+        }
+        return last
     }
 
     /// One DeleteObject per frame. A frame the body refuses (protected, card locked) is reported and skipped;
@@ -454,6 +559,9 @@ enum Importer {
             // which is slower still.
             if let seconds = options.transferTimeout { link.setReadTimeout(seconds) }
         }
+        if let sizes = options.benchmark {
+            return await bench(sizes: sizes, queue: queue, files: files, io: io, link: link, options: options, fujiProps: fujiProps)
+        }
         for index in queue.indices {
             if options.control.aborted || Task.isCancelled { return await stop(files, io) }
             let frame = queue[index]
@@ -572,12 +680,37 @@ enum Importer {
             }
 
             options.progress?(LiveProgress(index: index, count: queue.count, name: files[index].name, got: 0, total: reported, bytesPerSecond: 0, copiedBytes: copiedBytes))
-            var offset = 0
-            var blob = Data()
-            if options.saveDirectory != nil { blob.reserveCapacity(reported) }
-            var stalls = 0
             let total = reported
+            // Streamed to a hidden .part next to the photo, so a run that dies keeps what it got and the next
+            // one resumes from there. Without a save directory (tests, the virtual body) the bytes are dropped.
+            var sink: PartFile?
+            if let dir = options.saveDirectory {
+                do {
+                    sink = try PartFile(directory: dir, name: files[index].name, total: total)
+                } catch {
+                    files[index].state = "lost"
+                    io.fail("Save failed", "Could not open \(files[index].name) for writing. \(IO.describe(error))", op: "save")
+                    continue
+                }
+            }
+            var offset = sink?.length ?? 0
+            if offset > 0 {
+                io.note("Resuming \(files[index].name)", "\(ByteFormat.string(offset)) already on disk from an earlier run. Asking only for the rest.", op: "resume", bytes: offset)
+            }
+            let resumedAt = offset
+            var stalls = 0
+            // Stalls in a row without a single window getting through. Progress resets it.
+            var stuck = 0
             let pullStart = io.now()
+            func write(_ data: Data) -> Bool {
+                do {
+                    try sink?.append(data)
+                    return true
+                } catch {
+                    io.fail("Save failed", "\(files[index].name) at \(ByteFormat.string(offset)). \(IO.describe(error))", op: "save")
+                    return false
+                }
+            }
             // Measured on an X100VI over USB: 1 MB from an odd offset takes ~1.5 s instead of 38 ms, and an even
             // unaligned one ~95 ms. A short window or a half-kept stall must not leave the next read there, so the
             // tail past the last 512-byte boundary is dropped and asked for again.
@@ -585,85 +718,83 @@ enum Importer {
                 let extra = Importer.misalignment(offset: offset, total: total)
                 guard extra > 0 else { return }
                 offset -= extra
-                if options.saveDirectory != nil { blob.removeLast(extra) }
-                io.note("Realigned to \(offset)", "Dropped \(extra) B so the next GetPartialObject starts on a 512-byte boundary.", op: "partial")
+                try? sink?.truncate(to: offset)
+                io.note("Realigned to \(offset)", "Dropped \(extra) B so the next GetPartialObject starts on a 512-byte boundary.", op: "realign", bytes: extra)
+            }
+            func giveUp(_ reason: String, _ summary: String) async -> RunResult {
+                files[index].state = "lost"
+                files[index].got = offset
+                sink?.close()
+                if offset > 0 && sink != nil {
+                    io.note("Kept \(ByteFormat.string(offset))", "\(files[index].name) stays on disk as a .part; the next import resumes it.", op: "resume", bytes: offset)
+                }
+                await link.close()
+                return RunResult(ok: false, reason: reason, summary: summary, files: files)
             }
             while offset < total {
-                if options.control.aborted || Task.isCancelled { return await stop(files, io) }
-                let ask = min(Fuji.partialMax, total - offset)
+                if options.control.aborted || Task.isCancelled {
+                    sink?.close()
+                    return await stop(files, io)
+                }
+                let ask = min(options.window, total - offset)
                 let exchange = await io.partial(handle: frame.handle, offset: offset, ask: ask, name: files[index].name)
                 if !exchange.completed {
                     stalls += 1
-                    offset += exchange.bytes
-                    if options.saveDirectory != nil { blob.append(exchange.payload) }
+                    stuck += 1
+                    guard write(exchange.payload) else { return await giveUp("save", "Could not write \(files[index].name) to disk.") }
+                    offset += exchange.payload.count
                     realign()
                     files[index].got = offset
-                    if stalls > 4 {
-                        files[index].state = "lost"
-                        io.fail("Socket stayed quiet", "Gave up after \(stalls) reconnects.", op: "reconnect")
-                        await link.close()
-                        return RunResult(
-                            ok: false,
-                            reason: "stall",
-                            summary: "The command socket stayed quiet \(ByteFormat.string(offset)) into \(frame.name).",
-                            files: files
-                        )
+                    if stuck > 4 {
+                        io.fail("Socket stayed quiet", "Gave up after \(stuck) reconnects in a row without a window getting through.", op: "reconnect")
+                        return await giveUp("stall", "The camera stopped answering \(ByteFormat.string(offset)) into \(frame.name).")
                     }
                     io.fail("TCP stall", "\(ByteFormat.string(offset)) is in hand. Re-opening the link from that offset. \(exchange.error.map(IO.describe) ?? "")", op: "reconnect")
                     await link.close()
-                    let reopenStart = io.now()
-                    do {
-                        try await io.reopen(settle: options.paceNanos > 0 || options.live)
-                        io.ok("Reconnected", "Resuming \(files[index].name) at \(ByteFormat.string(offset)).", op: "reconnect-total", took: io.now() - reopenStart)
-                    } catch {
-                        io.fail("Reconnect failed", IO.describe(error), op: "reconnect-total", took: io.now() - reopenStart)
-                        await link.close()
-                        return RunResult(ok: false, reason: "link", summary: "Reconnect failed. \(IO.describe(error))", files: files)
+                    if let error = await reconnect(io: io, link: link, options: options, resume: "\(files[index].name) at \(ByteFormat.string(offset))") {
+                        return await giveUp("link", "Reconnect failed. \(IO.describe(error))")
                     }
                     continue
                 }
                 if !accepted(exchange.response) {
-                    files[index].state = "lost"
                     let summary = "GetPartialObject for \(frame.name) was rejected (0x\(String(exchange.response, radix: 16)))."
                     io.fail("Partial rejected", summary)
-                    await link.close()
-                    return RunResult(ok: false, reason: "partial", summary: summary, files: files)
+                    return await giveUp("partial", summary)
                 }
                 if exchange.bytes == 0 {
-                    files[index].state = "lost"
                     let summary = "GetPartialObject returned no bytes for \(frame.name)."
                     io.fail("Empty partial", summary)
-                    await link.close()
-                    return RunResult(ok: false, reason: "partial", summary: summary, files: files)
+                    return await giveUp("partial", summary)
                 }
+                guard write(exchange.payload) else { return await giveUp("save", "Could not write \(files[index].name) to disk.") }
+                stuck = 0
                 offset += exchange.bytes
-                if options.saveDirectory != nil { blob.append(exchange.payload) }
                 realign()
                 files[index].got = offset
                 let seconds = max(0.001, (io.now() - pullStart) / 1000)
-                options.progress?(LiveProgress(index: index, count: queue.count, name: files[index].name, got: offset, total: total, bytesPerSecond: Double(offset) / seconds, copiedBytes: copiedBytes + offset))
+                options.progress?(LiveProgress(index: index, count: queue.count, name: files[index].name, got: offset, total: total, bytesPerSecond: Double(offset - resumedAt) / seconds, copiedBytes: copiedBytes + offset))
             }
             let pullMs = io.now() - pullStart
             transferMs += pullMs
-            copiedBytes += offset
+            copiedBytes += offset - resumedAt
             // A resized file is as long as the body says, not as long as the one on the card.
             let goal = io.resizeRate == nil && frame.bytes > 0 ? frame.bytes : total
             files[index].got = offset
             files[index].total = goal
             files[index].state = goal > 0 && offset >= goal ? "full" : "partial"
-            if let dir = options.saveDirectory, !blob.isEmpty {
-                let url = dir.appendingPathComponent(files[index].name)
+            if let sink {
                 let saveStart = io.now()
                 do {
-                    try blob.write(to: url, options: .atomic)
-                    io.note("Saved \(files[index].name)", url.lastPathComponent, op: "save", took: io.now() - saveStart, bytes: blob.count)
+                    try sink.finish()
+                    io.note("Saved \(files[index].name)", sink.destination.lastPathComponent, op: "save", took: io.now() - saveStart, bytes: offset)
                 } catch {
+                    sink.close()
                     io.fail("Save failed", "\(files[index].name). \(IO.describe(error))", op: "save", took: io.now() - saveStart)
                 }
             }
             io.ok(
                 "File \(files[index].name)",
-                "\(ByteFormat.string(offset)) in \(IO.ms(pullMs)), \(ByteFormat.rate(Double(offset), ms: pullMs)). \(stalls) stall\(stalls == 1 ? "" : "s"). Whole file with props \(IO.ms(io.now() - fileStart)).",
+                "\(ByteFormat.string(offset - resumedAt)) in \(IO.ms(pullMs)), \(ByteFormat.rate(Double(offset - resumedAt), ms: pullMs))\(resumedAt > 0 ? " after resuming at \(ByteFormat.string(resumedAt))" : ""). \(stalls) stall\(stalls == 1 ? "" : "s"). Whole file with props \(IO.ms(io.now() - fileStart)).",
                 op: "file",
                 took: io.now() - fileStart,
                 bytes: offset
@@ -821,15 +952,16 @@ private final class IO: @unchecked Sendable {
     func wait(_ title: String, _ detail: String, op: String = "") {
         emit("IN", title, detail, Data(), "wait", op: op)
     }
-    func fail(_ title: String, _ detail: String, op: String = "", took: Double? = nil) {
-        emit("ERR", title, detail, Data(), "fail", op: op, took: took)
+    func fail(_ title: String, _ detail: String, op: String = "", took: Double? = nil, bytes: Int = 0) {
+        emit("ERR", title, detail, Data(), "fail", op: op, took: took, bytes: bytes)
     }
 
     func readPacket() async throws -> Data {
         let head = try await link.read(count: 4)
         headAt = now()
         let length = Int(LE.u32(head, 0))
-        if length < 4 || length > Fuji.partialMax + 65_536 { throw LinkError.badLength(length) }
+        // The speed test asks for windows up to 8 MB.
+        if length < 4 || length > Fuji.windowMax + 65_536 { throw LinkError.badLength(length) }
         if length == 4 { return head }
         let rest = try await link.read(count: length - 4)
         return head + rest
@@ -955,20 +1087,21 @@ private final class IO: @unchecked Sendable {
         return FujiEvents.value(data, prop: Fuji.cameraState) ?? 0
     }
 
-    func partial(handle: Int, offset: Int, ask: Int, name: String) async -> Exchange {
+    func partial(handle: Int, offset: Int, ask: Int, name: String, op: String = "partial") async -> Exchange {
         let packet = Packets.command(code: Fuji.getPartial, tid: tid, params: [UInt32(handle), UInt32(offset), UInt32(ask)])
-        out("GetPartialObject \(name)", "Offset \(offset), max \(ask).", packet, op: "partial")
+        out("GetPartialObject \(name)", "Offset \(offset), max \(ask).", packet, op: op)
         tid += 1
         let start = now()
         var payload = Data()
         do {
             try await link.write(packet)
+            link.markWindow()
             let first = try await readPacket()
             // Over USB ImageCaptureCore hands over the whole window at once, so there is no first byte to time.
             let firstByte: Double? = transport == .usb ? nil : headAt - start
             if Packets.ptpType(first) == 3 {
                 let rc = Packets.ptpCode(first)
-                emit("IN", "Partial \(name)", "No data phase, response 0x\(String(rc, radix: 16)).", Data(), "fail", op: "partial", took: now() - start)
+                emit("IN", "Partial \(name)", "No data phase, response 0x\(String(rc, radix: 16)).", Data(), "fail", op: op, took: now() - start)
                 return Exchange(payload: Data(), completed: true, response: rc)
             }
             payload = Packets.payload(first)
@@ -976,20 +1109,25 @@ private final class IO: @unchecked Sendable {
             let response = try await readPacket()
             let rc = Packets.ptpType(response) == 3 ? Packets.ptpCode(response) : 0
             let took = now() - start
+            let stats = link.windowStats()
+            let flow = stats.map { ", \($0.receives) receives, longest silence \(IO.ms($0.longestGapMs))" } ?? ""
             emit(
                 "IN",
                 "Partial \(name)",
-                "\(ByteFormat.string(payload.count)) at \(offset) in \(IO.ms(took)), \(ByteFormat.rate(Double(payload.count), ms: took)). First byte \(firstByte.map(IO.ms) ?? "n/a"), response \(IO.ms(now() - dataDone)) after data.",
+                "\(ByteFormat.string(payload.count)) at \(offset) in \(IO.ms(took)), \(ByteFormat.rate(Double(payload.count), ms: took)). First byte \(firstByte.map(IO.ms) ?? "n/a"), response \(IO.ms(now() - dataDone)) after data\(flow).",
                 Data(),
                 Fuji.okay(rc) ? "ok" : "fail",
-                op: "partial",
+                op: op,
                 took: took,
                 bytes: payload.count,
-                firstByte: firstByte
+                firstByte: firstByte,
+                stats: stats
             )
             return Exchange(payload: payload, completed: true, response: rc)
         } catch {
-            emit("ERR", "Partial \(name)", "\(IO.describe(error)). \(ByteFormat.string(payload.count)) kept from this window.", Data(), "fail", op: "partial", took: now() - start, bytes: payload.count)
+            let stats = link.windowStats()
+            let flow = stats.map { " \($0.receives) receives before it went quiet." } ?? ""
+            emit("ERR", "Partial \(name)", "\(IO.describe(error)). \(ByteFormat.string(payload.count)) kept from this window.\(flow)", Data(), "fail", op: op, took: now() - start, bytes: payload.count, stats: stats)
             return Exchange(payload: payload, completed: false, response: 0, error: error)
         }
     }
@@ -1008,7 +1146,7 @@ private final class IO: @unchecked Sendable {
         }
     }
 
-    private func emit(_ dir: String, _ title: String, _ detail: String, _ data: Data, _ level: String, op: String = "", took: Double? = nil, bytes: Int = 0, firstByte: Double? = nil) {
+    private func emit(_ dir: String, _ title: String, _ detail: String, _ data: Data, _ level: String, op: String = "", took: Double? = nil, bytes: Int = 0, firstByte: Double? = nil, stats: WindowStats? = nil) {
         lock.lock()
         let line = TraceLine(
             id: seq,
@@ -1022,7 +1160,9 @@ private final class IO: @unchecked Sendable {
             took: took,
             bytes: bytes,
             file: file,
-            firstByte: firstByte
+            firstByte: firstByte,
+            gap: stats?.longestGapMs,
+            receives: stats?.receives
         )
         seq += 1
         log(line)

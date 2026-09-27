@@ -44,6 +44,8 @@ enum Purpose: Equatable {
     case open(Int)
     /// These frames off the card, for good.
     case delete(Set<Int>)
+    /// Reads the newest frame with several window sizes and keeps the fastest. Nothing saved.
+    case speedTest
 }
 
 @MainActor
@@ -120,6 +122,10 @@ final class BenchModel {
         didSet { UserDefaults.standard.set(scope.rawValue, forKey: "BridgeScope") }
     }
     /// Camera address. 192.168.0.1 on the body's own Wi-Fi; a Mac running tools/fakecam.py for rehearsals.
+    /// Bytes per GetPartialObject over Wi-Fi. 1 MB like XApp until a speed test finds better.
+    var windowSize: Int = UserDefaults.standard.object(forKey: "BridgeWindow") as? Int ?? Fuji.partialMax {
+        didSet { UserDefaults.standard.set(windowSize, forKey: "BridgeWindow") }
+    }
     /// Wi-Fi imports only: resized by the camera (S by default, the radio is slow), or originals.
     var importSize: ImportSize = ImportSize(rawValue: UserDefaults.standard.string(forKey: "BridgeImportSize") ?? "") ?? .small {
         didSet { UserDefaults.standard.set(importSize.rawValue, forKey: "BridgeImportSize") }
@@ -277,6 +283,14 @@ final class BenchModel {
 
     /// Scene phase changes. iOS suspends the app a few seconds after it leaves the screen, and the socket goes with it.
     func lifecycle(_ phase: String) {
+        if phase == "active", !busy, let pending = resumeOnReturn {
+            resumeOnReturn = nil
+            if Date().timeIntervalSince(pending.at) < 600 {
+                start(.bridge, mode: .camera, transport: runTransport, purpose: pending.purpose)
+                session?.event("Resumed", "The last import stopped when Fuji Bridge left the screen. Picking it up where it was.")
+                return
+            }
+        }
         guard busy, let session else { return }
         // A hidden Mac window keeps running; a phone app in the background is suspended within seconds.
         let suspends = phase == "background" && !ProcessInfo.processInfo.isMacCatalystApp
@@ -335,6 +349,7 @@ final class BenchModel {
         let host = self.host.trimmingCharacters(in: .whitespaces)
         let control = self.control
         var latest = scope == .all ? nil : scope.rawValue
+        if purpose == .speedTest { latest = 1 }
         let skipNewest = purpose == .browse ? browseSkip : 0
         if purpose == .browse, let limit = browseLimit { latest = limit }
         browseLimit = nil
@@ -349,6 +364,7 @@ final class BenchModel {
         case .browse: use = "browse"
         case .open: use = "open"
         case .delete: use = "delete"
+        case .speedTest: use = "speedtest"
         default: use = "import"
         }
         let session = SessionLog(label: mode == .camera ? "\(transport.rawValue)-\(use)" : "virtual-\(kind.rawValue)")
@@ -395,6 +411,17 @@ final class BenchModel {
                 let rehearsal = transport == .wifi && (host.hasPrefix("127.") || host == "localhost")
                 let dir = opening ? Self.previewFolder() : (rehearsal ? Self.rehearsalFolder() : Self.folder())
                 liveLibrary = !opening && !rehearsal
+                let size: ImportSize
+                switch purpose {
+                case .newPhotos, .selected: size = importSize
+                default: size = .original
+                }
+                let window = transport == .wifi ? windowSize : Fuji.partialMax
+                var rejoin: (@Sendable () async -> Bool)?
+                if transport == .wifi && !rehearsal {
+                    rejoin = { [weak self] in await self?.rejoinCamera(session) ?? false }
+                }
+                let benchmark: [Int]? = purpose == .speedTest ? Self.benchWindows : nil
                 result = await Importer.run(
                     link: link,
                     options: RunOptions(
@@ -416,12 +443,10 @@ final class BenchModel {
                         clockOrigin: session.origin,
                         delete: { if case .delete = purpose { return true } else { return false } }(),
                         transferTimeout: 30,
-                        size: {
-                            switch purpose {
-                            case .newPhotos, .selected: return importSize
-                            default: return .original
-                            }
-                        }()
+                        size: size,
+                        window: window,
+                        rejoin: rejoin,
+                        benchmark: benchmark
                     ),
                     log: log
                 )
@@ -436,6 +461,11 @@ final class BenchModel {
                     session.event("Socket totals", "\(ByteFormat.string(tcp.bytesIn)) in over \(tcp.receives) receives, \(ByteFormat.string(tcp.bytesOut)) out.", op: "net")
                 }
                 saved = Self.photos()
+                if purpose == .speedTest, result.ok { adoptFastestWindow(session) }
+                if !result.ok, leftScreen, purpose == .newPhotos || { if case .selected = purpose { return true } else { return false } }() {
+                    // Picked up again as soon as the app is back on screen; the .part files make it a resume.
+                    resumeOnReturn = (purpose, Date())
+                }
                 if opening, let file = result.files.first {
                     let url = dir.appendingPathComponent(file.name)
                     if FileManager.default.fileExists(atPath: url.path) { fullSize[file.handle] = url }
@@ -500,6 +530,45 @@ final class BenchModel {
 
     /// This run went to the background on iOS at some point.
     @ObservationIgnored private var leftScreen = false
+    /// An import cut short by leaving the screen, to start again when the app is back.
+    @ObservationIgnored private var resumeOnReturn: (purpose: Purpose, at: Date)?
+
+    /// Window sizes the speed test tries, smallest first.
+    static let benchWindows = [256 * 1024, 512 * 1024, 1_048_576, 2 * 1_048_576, 4 * 1_048_576]
+
+    func speedTest() {
+        start(.bridge, mode: .camera, transport: .wifi, purpose: .speedTest)
+    }
+
+    /// After a speed test: use the fastest window size from now on, if it clearly beats the current one.
+    private func adoptFastestWindow(_ session: SessionLog) {
+        let rates = session.lines.filter { $0.op == "bench-total" && $0.level != "fail" && ($0.took ?? 0) > 0 }
+            .compactMap { line -> (Int, Double)? in
+                let label = line.title.replacingOccurrences(of: "Window ", with: "")
+                guard let size = Self.benchWindows.first(where: { ByteFormat.string($0) == label }) else { return nil }
+                return (size, Double(line.bytes) / (line.took ?? 1))
+            }
+        guard let best = rates.max(by: { $0.1 < $1.1 }) else { return }
+        let current = rates.first { $0.0 == windowSize }?.1 ?? 0
+        if best.0 != windowSize, best.1 > current * 1.1 {
+            session.event("Window size", "Using \(ByteFormat.string(best.0)) windows from now on instead of \(ByteFormat.string(windowSize)).", op: "bench")
+            windowSize = best.0
+        } else {
+            session.event("Window size", "Keeping \(ByteFormat.string(windowSize)) windows.", op: "bench")
+        }
+    }
+
+    /// Between reconnect attempts: if the phone fell off the camera's network (iOS went back to the home Wi-Fi),
+    /// join it again. True when this device has an address on the camera's network.
+    private func rejoinCamera(_ session: SessionLog) async -> Bool {
+        let host = self.host
+        if WifiJoin.hasAddress(near: host) { return true }
+        guard let wifi = cameraWifi, !ProcessInfo.processInfo.isMacCatalystApp else { return false }
+        await waitForScreen(wifi.ssid, session)
+        session.event("Rejoining", "No address on the camera's network any more. Joining \(wifi.ssid) again.", op: "net", level: "warn")
+        _ = try? await WifiJoin.join(wifi, host: host) { title, detail in session.event(title, detail, op: "ble") }
+        return WifiJoin.hasAddress(near: host)
+    }
 
     /// iOS refuses a network join from an app that is not on screen ("application is not in the foreground").
     /// If the user switched away while the camera was waking, wait for them to come back, then join.
@@ -546,7 +615,9 @@ final class BenchModel {
             if line.title == "DF00 = 0" && line.ms - since > 2000 { phase = "Press OK on the camera" }
         case "setup", "setup-total", "thumb": phase = "Reading the card"
         case "prep", "info", "partial", "save", "file": phase = "Copying"
-        case "reconnect": phase = "Reconnecting"
+        case "reconnect", "reconnect-total": phase = "Reconnecting"
+        case "bench", "bench-total": phase = "Testing speed"
+        case "resume": phase = "Copying"
         default: break
         }
     }
@@ -652,7 +723,7 @@ final class BenchModel {
             object: nil,
             queue: .main
         ) { _ in
-            session.event("Memory warning", "iOS asked Fuji Bridge to free memory. Whole files are held in memory until saved.", level: "warn")
+            session.event("Memory warning", "iOS asked Fuji Bridge to free memory. Files stream to disk, so this comes from elsewhere (thumbnails, the viewer).", level: "warn")
         }
         let env = DeviceInfo.snapshot(path: "pending")
         session.event("Session", "\(env.platform), \(env.device), \(env.system), app \(env.app) (\(env.build)), thermal \(env.thermal)\(env.lowPower ? ", Low Power Mode" : "").")

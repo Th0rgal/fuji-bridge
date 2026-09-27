@@ -156,6 +156,48 @@ struct FileStat: Codable, Sendable, Equatable {
     var stalls: Int
 }
 
+/// How the bytes actually moved, over every window of the run. What to look at before touching the protocol.
+struct TransferStat: Codable, Sendable, Equatable {
+    /// GetPartialObject exchanges that delivered data, and what they delivered.
+    var windows: Int
+    var bytes: Int
+    /// Bytes over time spent inside the windows: the pipe itself.
+    var wireMBps: Double
+    /// Bytes over the whole stretch from the first window to the last, reconnects and props included.
+    var effectiveMBps: Double
+    var windowMBpsP10: Double
+    var windowMBpsP50: Double
+    var windowMBpsP90: Double
+    /// Command to first byte: the camera's latency per window.
+    var firstByteP50Ms: Double
+    var firstByteP95Ms: Double
+    var firstByteMaxMs: Double
+    /// Longest silence inside a window once bytes flowed: radio dropouts. Zero over USB.
+    var gapP50Ms: Double
+    var gapP95Ms: Double
+    var gapMaxMs: Double
+    var receivesPerWindow: Double
+    var reconnects: Int
+    var reconnectMs: Double
+    /// Windows that died, and bytes asked for twice (realigned tails).
+    var failedWindows: Int
+    var resentBytes: Int
+    /// Bytes that came from .part files of earlier runs instead of the camera.
+    var resumedBytes: Int
+    /// MB/s in each 5 s slice of the transfer, from the first window on.
+    var timeline: [Double]
+    var bench: [BenchStat]
+}
+
+struct BenchStat: Codable, Sendable, Equatable {
+    var window: String
+    var ok: Bool
+    var bytes: Int
+    var ms: Double
+    var mbps: Double
+    var firstByteP50Ms: Double
+}
+
 struct Finding: Codable, Sendable, Equatable {
     var severity: String
     var title: String
@@ -175,6 +217,7 @@ struct Report: Codable, Sendable {
     var phases: [OpStat]
     var slowest: [TraceLine]
     var files: [FileStat]
+    var transfer: TransferStat?
     var findings: [Finding]
     var lines: [TraceLine]
 }
@@ -252,6 +295,7 @@ enum Diagnostics {
         let copiedMs = copied.compactMap(\.took).reduce(0, +)
         let average = copiedMs > 0 ? Double(copiedBytes) / 1_048_576 / (copiedMs / 1000) : 0
 
+        let transfer = transferStat(lines)
         return Report(
             stamp: log.stamp,
             started: log.started,
@@ -265,9 +309,91 @@ enum Diagnostics {
             phases: phases,
             slowest: slowest,
             files: files,
-            findings: findings(lines: lines, phases: phases, files: files, result: result, duration: duration, average: average),
+            transfer: transfer,
+            findings: findings(lines: lines, phases: phases, files: files, result: result, duration: duration, average: average)
+                + transferFindings(transfer),
             lines: lines
         )
+    }
+
+    static func transferStat(_ lines: [TraceLine]) -> TransferStat? {
+        let windows = lines.filter { ($0.op == "partial" || $0.op == "bench") && $0.dir == "IN" && $0.took != nil && $0.bytes > 0 }
+        let failed = lines.filter { ($0.op == "partial" || $0.op == "bench") && $0.dir == "ERR" }
+        let benches = lines.filter { $0.op == "bench-total" && $0.took != nil }
+        guard !windows.isEmpty || !failed.isEmpty || !benches.isEmpty else { return nil }
+        let bytes = windows.map(\.bytes).reduce(0, +)
+        let inside = windows.compactMap(\.took).reduce(0, +)
+        let starts = windows.map { $0.ms - ($0.took ?? 0) }
+        let span = (windows.map(\.ms).max() ?? 0) - (starts.min() ?? 0)
+        let rates = windows.compactMap { line -> Double? in
+            guard let took = line.took, took > 0 else { return nil }
+            return Double(line.bytes) / 1_048_576 / (took / 1000)
+        }.sorted()
+        let firsts = windows.compactMap(\.firstByte).sorted()
+        let gaps = windows.compactMap(\.gap).sorted()
+        let receives = windows.compactMap(\.receives)
+        // 5 s slices, each window's bytes counted where it ended.
+        var timeline: [Double] = []
+        if let origin = starts.min() {
+            let slice = 5000.0
+            var buckets = [Int](repeating: 0, count: Int(span / slice) + 1)
+            for line in windows { buckets[min(buckets.count - 1, Int((line.ms - origin) / slice))] += line.bytes }
+            timeline = buckets.map { Double($0) / 1_048_576 / (slice / 1000) }
+        }
+        let bench = benches.map { total -> BenchStat in
+            let name = total.title.replacingOccurrences(of: "Window ", with: "")
+            let mine = windows.filter { $0.op == "bench" && $0.title == "Partial \(name) windows" }.compactMap(\.firstByte).sorted()
+            let ms = total.took ?? 0
+            return BenchStat(window: name, ok: total.level != "fail", bytes: total.bytes, ms: ms,
+                             mbps: ms > 0 ? Double(total.bytes) / 1_048_576 / (ms / 1000) : 0,
+                             firstByteP50Ms: percentile(mine, 0.5))
+        }
+        return TransferStat(
+            windows: windows.count,
+            bytes: bytes,
+            wireMBps: inside > 0 ? Double(bytes) / 1_048_576 / (inside / 1000) : 0,
+            effectiveMBps: span > 0 ? Double(bytes) / 1_048_576 / (span / 1000) : 0,
+            windowMBpsP10: percentile(rates, 0.1),
+            windowMBpsP50: percentile(rates, 0.5),
+            windowMBpsP90: percentile(rates, 0.9),
+            firstByteP50Ms: percentile(firsts, 0.5),
+            firstByteP95Ms: percentile(firsts, 0.95),
+            firstByteMaxMs: firsts.last ?? 0,
+            gapP50Ms: percentile(gaps, 0.5),
+            gapP95Ms: percentile(gaps, 0.95),
+            gapMaxMs: gaps.last ?? 0,
+            receivesPerWindow: receives.isEmpty ? 0 : Double(receives.reduce(0, +)) / Double(receives.count),
+            reconnects: lines.filter { $0.title == "TCP stall" }.count,
+            reconnectMs: lines.filter { $0.op == "reconnect-total" }.compactMap(\.took).reduce(0, +),
+            failedWindows: failed.count,
+            resentBytes: lines.filter { $0.op == "realign" }.map(\.bytes).reduce(0, +),
+            resumedBytes: lines.filter { $0.op == "resume" && $0.title.hasPrefix("Resuming") }.map(\.bytes).reduce(0, +),
+            timeline: timeline,
+            bench: bench
+        )
+    }
+
+    /// What the transfer numbers say about where the time goes.
+    static func transferFindings(_ t: TransferStat?) -> [Finding] {
+        guard let t, t.windows > 0 else { return [] }
+        var out: [Finding] = []
+        if t.gapP95Ms > 500 {
+            out.append(Finding(severity: "warn", title: "The radio drops out mid-window",
+                               detail: "1 window in 20 went quiet for \(ms(t.gapP95Ms)) or more after its first byte (worst \(ms(t.gapMaxMs))). That is Wi-Fi, not the camera: distance, a wall, 2.4 GHz interference, or Bluetooth sharing the antenna."))
+        }
+        if t.wireMBps > 0, t.effectiveMBps < t.wireMBps * 0.6 {
+            out.append(Finding(severity: "warn", title: String(format: "%.0f%% of the time is between windows", (1 - t.effectiveMBps / t.wireMBps) * 100),
+                               detail: String(format: "Windows move %.2f MB/s, the run as a whole %.2f MB/s. Reconnects took %@, the rest is props, ObjectInfo and saving.", t.wireMBps, t.effectiveMBps, ms(t.reconnectMs))))
+        }
+        if t.windowMBpsP50 > 0, t.windowMBpsP10 < t.windowMBpsP50 * 0.3 {
+            out.append(Finding(severity: "info", title: "Uneven speed",
+                               detail: String(format: "Median window %.2f MB/s, slowest tenth under %.2f MB/s. The timeline shows when.", t.windowMBpsP50, t.windowMBpsP10)))
+        }
+        if let best = t.bench.filter(\.ok).max(by: { $0.mbps < $1.mbps }) {
+            out.append(Finding(severity: "info", title: "Speed test: \(best.window) windows were fastest",
+                               detail: t.bench.map { "\($0.window) " + ($0.ok ? String(format: "%.2f MB/s", $0.mbps) : "failed") }.joined(separator: ", ")))
+        }
+        return out
     }
 
     /// Plain rules over the trace. Each one names something that cost time or broke the session.
@@ -292,7 +418,7 @@ enum Diagnostics {
         if stalls > 0 {
             let reconnect = phase("reconnect-total")
             let lost = lines.filter { $0.op == "partial" && $0.level == "fail" }.compactMap(\.took).reduce(0, +)
-            add("warn", "\(stalls) stall\(stalls == 1 ? "" : "s") and reconnect\(stalls == 1 ? "" : "s")", "\(ms(lost)) lost inside the failed reads, then \(ms(reconnect?.totalMs ?? 0)) to reconnect. Each one repeats init, settle, OpenSession and three props.")
+            add("warn", "\(stalls) stall\(stalls == 1 ? "" : "s") and reconnect\(stalls == 1 ? "" : "s")", "\(ms(lost)) lost inside the failed reads, then \(ms(reconnect?.totalMs ?? 0)) to reconnect. Each one repeats init, settle, OpenSession and the import props; the file resumes from the bytes on disk.")
         }
         let initFails = lines.filter { $0.title == "Init Fail" }.count
         if initFails > 0 {
@@ -321,7 +447,7 @@ enum Diagnostics {
         if let prep = phase("prep"), prep.count > 0 {
             let perFile = prep.totalMs / Double(max(1, files.filter { $0.state != "skipped" }.count))
             if perFile > 150 {
-                add("warn", "Per-file props cost \(ms(perFile))", "D226/D227 set and reset plus GetObjectInfo around every file: \(prep.count) exchanges, \(ms(prep.totalMs)) in total, p95 \(ms(prep.p95Ms)).")
+                add("warn", "Per-file overhead \(ms(perFile))", "GetObjectInfo and ObjectSize around every file: \(prep.count) exchanges, \(ms(prep.totalMs)) in total, p95 \(ms(prep.p95Ms)).")
             }
         }
         if let partial = phase("partial") {
@@ -373,7 +499,7 @@ enum Diagnostics {
     static func text(_ report: Report) -> String {
         var out: [String] = []
         let env = report.environment
-        out.append("LATCH DIAGNOSTICS \(report.stamp)")
+        out.append("FUJI BRIDGE DIAGNOSTICS \(report.stamp)")
         out.append("")
         out.append("App        \(env.app) (\(env.build)) \(env.bundle)")
         out.append("Platform   \(env.platform)")
@@ -411,6 +537,21 @@ enum Diagnostics {
             }
         }
         out.append("")
+        if let t = report.transfer {
+            out.append("TRANSFER")
+            out.append(String(format: "  %d windows, %@, wire %.2f MB/s, effective %.2f MB/s", t.windows, ByteFormat.string(t.bytes), t.wireMBps, t.effectiveMBps))
+            out.append(String(format: "  window MB/s     p10 %.2f  p50 %.2f  p90 %.2f", t.windowMBpsP10, t.windowMBpsP50, t.windowMBpsP90))
+            out.append("  first byte      p50 \(ms(t.firstByteP50Ms))  p95 \(ms(t.firstByteP95Ms))  max \(ms(t.firstByteMaxMs))")
+            out.append("  silence inside  p50 \(ms(t.gapP50Ms))  p95 \(ms(t.gapP95Ms))  max \(ms(t.gapMaxMs))" + String(format: "  (%.0f receives per window)", t.receivesPerWindow))
+            out.append("  reconnects      \(t.reconnects), \(ms(t.reconnectMs)); \(t.failedWindows) windows died; \(ByteFormat.string(t.resentBytes)) asked twice; \(ByteFormat.string(t.resumedBytes)) resumed from disk")
+            if !t.timeline.isEmpty {
+                out.append("  MB/s per 5 s    " + t.timeline.map { String(format: "%.1f", $0) }.joined(separator: " "))
+            }
+            for b in t.bench {
+                out.append("  speed test \(b.window.padding(toLength: 7, withPad: " ", startingAt: 0)) " + (b.ok ? String(format: "%.2f MB/s", b.mbps) : "failed") + "  \(ByteFormat.string(b.bytes)) in \(ms(b.ms)), first byte p50 \(ms(b.firstByteP50Ms))")
+            }
+            out.append("")
+        }
         out.append("SLOWEST EXCHANGES")
         for line in report.slowest {
             out.append("  \(pad(ms(line.took ?? 0), 9))  @\(ms(line.ms))  [\(line.op)] \(line.title)  \(line.detail)")

@@ -438,6 +438,7 @@ struct HomeView: View {
         }
         let copied = model.files.filter { $0.state == "full" }.count
         if model.purpose == .browse { return "\(model.cameraPhotos.count) on the camera" }
+        if model.purpose == .speedTest { return "Speed test done" }
         return copied == 0 ? "Up to date" : "\(copied) new photo\(copied == 1 ? "" : "s")"
     }
 
@@ -447,6 +448,7 @@ struct HomeView: View {
             guard let reason = model.report?.result.reason else { return nil }
             return ImportRun.why(reason)
         }
+        if model.purpose == .speedTest { return "Now using \(ByteFormat.string(model.windowSize)) windows · details in Diagnostics" }
         let copied = model.files.filter { $0.state == "full" }
         let already = model.files.filter { $0.state == "already" }.count
         var parts: [String] = []
@@ -490,6 +492,7 @@ struct HomeView: View {
         case .browse where runStep == runSteps.count - 1: return "Reading the card"
         case .open: return "Fetching full size"
         case .delete: return "Deleting from the camera"
+        case .speedTest where runStep == runSteps.count - 1: return "Testing Wi-Fi speed"
         default: return runSteps[min(runStep, runSteps.count - 1)].title
         }
     }
@@ -1423,11 +1426,13 @@ struct DiagnosticsView: View {
                     summary(current, files: shown == nil ? files : shownFiles)
                     tiles(current)
                     findings(current)
+                    if let transfer = current.transfer { transferSection(transfer) }
                     phases(current)
                     if !current.files.isEmpty { fileList(current) }
                 } else {
                     placeholder
                 }
+                if let model, model.mode == .camera || !model.busy { speedTestSection(model) }
                 historyList
                 footer
             }
@@ -1483,6 +1488,7 @@ struct DiagnosticsView: View {
         let copied = report.result.files.filter { $0.state == "full" }.count
         switch report.result.reason {
         case "previewed": return "Card listed"
+        case "benchmarked": return "Speed test"
         default: return copied == 0 ? "Up to date" : "\(copied) new photo\(copied == 1 ? "" : "s")"
         }
     }
@@ -1633,6 +1639,93 @@ struct DiagnosticsView: View {
         }
     }
 
+    // MARK: Transfer
+
+    /// How the bytes moved: the numbers to send when Wi-Fi is slow or keeps dropping.
+    private func transferSection(_ t: TransferStat) -> some View {
+        section("Wi-Fi transfer", symbol: "wave.3.right") {
+            if t.windows > 0 {
+                row(symbol: "speedometer", tint: Ink.muted, title: String(format: "%.2f MB/s moving, %.2f MB/s overall", t.wireMBps, t.effectiveMBps),
+                    detail: String(format: "%d windows, %@. Per window p10 %.2f · p50 %.2f · p90 %.2f MB/s.", t.windows, ByteFormat.string(t.bytes), t.windowMBpsP10, t.windowMBpsP50, t.windowMBpsP90))
+                row(symbol: "camera", tint: Ink.muted, title: "Camera answers in \(Diagnostics.ms(t.firstByteP50Ms))",
+                    detail: "Command to first byte, p95 \(Diagnostics.ms(t.firstByteP95Ms)), worst \(Diagnostics.ms(t.firstByteMaxMs)).")
+                if t.receivesPerWindow > 0 {
+                    row(symbol: "antenna.radiowaves.left.and.right", tint: t.gapP95Ms > 500 ? Ink.bad : Ink.muted, title: "Longest silence inside a window \(Diagnostics.ms(t.gapP50Ms))",
+                        detail: "p95 \(Diagnostics.ms(t.gapP95Ms)), worst \(Diagnostics.ms(t.gapMaxMs)). Long silences after the first byte are the radio, not the camera.")
+                }
+            }
+            row(symbol: "arrow.triangle.2.circlepath", tint: t.reconnects > 0 ? Ink.bad : Ink.muted,
+                title: t.reconnects == 0 ? "No reconnects" : "\(t.reconnects) reconnect\(t.reconnects == 1 ? "" : "s"), \(Diagnostics.ms(t.reconnectMs))",
+                detail: "\(t.failedWindows) window\(t.failedWindows == 1 ? "" : "s") died, \(ByteFormat.string(t.resentBytes)) asked twice, \(ByteFormat.string(t.resumedBytes)) resumed from an earlier run.")
+            if t.timeline.count > 1 { timeline(t.timeline) }
+            ForEach(t.bench, id: \.window) { b in
+                row(symbol: b.ok ? "square.stack.3d.up" : "xmark.circle", tint: b.ok ? Ink.muted : Ink.bad,
+                    title: "\(b.window) windows: " + (b.ok ? String(format: "%.2f MB/s", b.mbps) : "failed"),
+                    detail: "\(ByteFormat.string(b.bytes)) in \(Diagnostics.ms(b.ms)), first byte \(Diagnostics.ms(b.firstByteP50Ms)).")
+            }
+        }
+    }
+
+    /// MB/s per 5 s slice, as bars. Dips show when the radio or the camera stalled.
+    private func timeline(_ values: [Double]) -> some View {
+        let top = max(values.max() ?? 1, 0.1)
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .bottom, spacing: 2) {
+                ForEach(Array(values.enumerated()), id: \.offset) { _, v in
+                    RoundedRectangle(cornerRadius: 1.5)
+                        .fill(v < top * 0.25 ? Ink.bad.opacity(0.7) : Ink.ink2)
+                        .frame(height: max(2, 44 * v / top))
+                        .frame(maxWidth: 10)
+                }
+            }
+            .frame(height: 44, alignment: .bottom)
+            Text(String(format: "MB/s every 5 s, peak %.1f", top))
+                .font(Ink.side(.detail))
+                .foregroundStyle(Ink.muted)
+        }
+        .padding(.leading, 30)
+    }
+
+    /// Reads the newest photo with 256 KB to 4 MB windows and keeps the fastest for later imports.
+    private func speedTestSection(_ model: BenchModel) -> some View {
+        section("Wi-Fi speed test", symbol: "gauge.with.dots.needle.67percent") {
+            Text("Reads the newest photo on the card a few times with different window sizes, saves nothing, and keeps the fastest for later imports. About 40 MB over the air. Now using \(ByteFormat.string(model.windowSize)) windows.")
+                .font(Ink.side(.detail))
+                .foregroundStyle(Ink.ink2)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 10) {
+                Button {
+                    model.speedTest()
+                } label: {
+                    Label(model.busy && model.purpose == .speedTest ? "Testing…" : "Run the speed test", systemImage: "gauge.with.dots.needle.67percent")
+                        .font(Ink.side(.title, .semibold))
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 7)
+                        .foregroundStyle(Ink.paper)
+                        .background(Ink.ink, in: Capsule())
+                }
+                .buttonStyle(InkPress())
+                .disabled(model.busy)
+                .opacity(model.busy && model.purpose != .speedTest ? 0.4 : 1)
+                if model.busy && model.purpose == .speedTest, let p = model.progress {
+                    Text("\(p.name) · \(p.bytesPerSecond > 0 ? String(format: "%.1f MB/s", p.bytesPerSecond / 1_048_576) : model.phase)")
+                        .font(Ink.side(.detail))
+                        .monospacedDigit()
+                        .foregroundStyle(Ink.ink2)
+                } else if model.busy && model.purpose == .speedTest {
+                    Text(model.phase).font(Ink.side(.detail)).foregroundStyle(Ink.ink2)
+                }
+                Spacer()
+                if model.windowSize != Fuji.partialMax && !model.busy {
+                    Button("Back to 1 MB") { model.windowSize = Fuji.partialMax }
+                        .buttonStyle(.plain)
+                        .font(Ink.side(.detail))
+                        .foregroundStyle(Ink.ink2)
+                }
+            }
+        }
+    }
+
     // MARK: History
 
     private var historyList: some View {
@@ -1716,6 +1809,7 @@ struct DiagnosticsView: View {
         case "browse": what = "Browse"
         case "delete": what = "Delete from camera"
         case "open": what = "Full-size look"
+        case "speedtest": what = "Speed test"
         case "bridge", "latch", "xapp": what = "Test bench · \(use == "xapp" ? "XApp replay" : "Fuji Bridge")"
         default: what = "Import"
         }

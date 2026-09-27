@@ -22,6 +22,10 @@ final class TCPLink: ByteLink, @unchecked Sendable {
     private(set) var localNetworkDenied = false
     private(set) var bytesOut = 0
     private(set) var receives = 0
+    private let statsLock = NSLock()
+    private var windowReceives = 0
+    private var windowLastAt: UInt64 = 0
+    private var windowGap: UInt64 = 0
 
     init(host: String = Fuji.cameraHost, port: UInt16 = Fuji.port, connectTimeout: TimeInterval = 8, readTimeout: TimeInterval = 10) {
         self.host = host
@@ -36,6 +40,30 @@ final class TCPLink: ByteLink, @unchecked Sendable {
 
     func setReadTimeout(_ seconds: TimeInterval) {
         readTimeout = seconds
+    }
+
+    func markWindow() {
+        statsLock.lock()
+        windowReceives = 0
+        windowLastAt = 0
+        windowGap = 0
+        statsLock.unlock()
+    }
+
+    func windowStats() -> WindowStats? {
+        statsLock.lock()
+        defer { statsLock.unlock() }
+        return WindowStats(receives: windowReceives, longestGapMs: Double(windowGap) / 1_000_000)
+    }
+
+    private func counted(_ bytes: Int) {
+        let now = DispatchTime.now().uptimeNanoseconds
+        statsLock.lock()
+        // Bytes already buffered when the window started do not count; the first real receive only starts the clock.
+        if windowLastAt > 0 { windowGap = max(windowGap, now - windowLastAt) }
+        windowLastAt = now
+        windowReceives += 1
+        statsLock.unlock()
     }
 
     func open() async throws {
@@ -167,6 +195,7 @@ final class TCPLink: ByteLink, @unchecked Sendable {
         }
         receives += 1
         bytesIn += data.count
+        counted(data.count)
         return data
     }
 
