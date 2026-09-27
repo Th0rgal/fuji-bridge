@@ -29,13 +29,11 @@
 
 <br>
 
-I love my Fujifilm X100VI. I didn't love the app that comes with it: imports stuck on a spinner, a Wi-Fi link that drops without saying why, and no way to know what went wrong. So I made my own.
+I love my Fujifilm X100VI, but the official app kept failing me: imports stuck on a spinner, Wi-Fi dropping for no reason. So I made my own. It works over USB or Wi-Fi, lets you look at the card before copying, and tells you why when something is slow.
 
-It copies over the cable or over Wi-Fi, lets me look at the card before copying anything, and when a transfer is slow, it tells me why. I use it with the X100VI; other recent Fujifilm bodies should work too.
+It's private: no account, no analytics, no server. It only talks to your camera.
 
-**Private.** No account, no analytics, no server. The app talks to your camera and nothing else. Photos stay in Files › Fuji Bridge, or Pictures › Fuji Bridge on the Mac.
-
-**Open source.** Buying it on the App Store is how you can support me. If you'd rather not, that's fine: build it yourself, it's the same app:
+It's also open source. Buying it is a nice way to support me, but you are free to build it yourself:
 
 ```sh
 brew install xcodegen
