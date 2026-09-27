@@ -130,7 +130,8 @@ final class BenchModel {
                 case "browse": self.browse()
                 case "viewer":
                     self.refreshSaved()
-                    if let first = self.saved.first { self.viewer = Viewer(tab: .imported, id: first.path) }
+                    let index = min(UserDefaults.standard.integer(forKey: "BridgeViewerIndex"), max(self.saved.count - 1, 0))
+                    if self.saved.indices.contains(index) { self.viewer = Viewer(tab: .imported, id: self.saved[index].path) }
                 default: self.importFromCamera(over: self.transport)
                 }
             }
@@ -494,8 +495,13 @@ final class BenchModel {
     /// Pictures/Fuji Bridge on the Mac, Documents/Fuji Bridge (the Files app) on the phone.
     static func folder() -> URL {
         let base: FileManager.SearchPathDirectory = ProcessInfo.processInfo.isMacCatalystApp ? .picturesDirectory : .documentDirectory
+        var name = "Fuji Bridge"
+        #if DEBUG
+        // Store screenshots: -BridgeFolder "Fuji Bridge Demo" shows a staged library instead of the real one.
+        if let demo = UserDefaults.standard.string(forKey: "BridgeFolder") { name = demo }
+        #endif
         let dir = FileManager.default.urls(for: base, in: .userDomainMask)[0]
-            .appendingPathComponent("Fuji Bridge", isDirectory: true)
+            .appendingPathComponent(name, isDirectory: true)
         // The app was called Latch: carry its Pictures/Latch over once instead of starting an empty library.
         let old = dir.deletingLastPathComponent().appendingPathComponent("Latch", isDirectory: true)
         if !FileManager.default.fileExists(atPath: dir.path), FileManager.default.fileExists(atPath: old.path) {

@@ -25,6 +25,17 @@ struct TitlebarHider: UIViewRepresentable {
             // The strip carries the grid's switch and action instead of an empty title.
             guard let scene = window?.windowScene else { return }
             MainActor.assumeIsolated { MacToolbar.shared.install(on: scene) }
+            #if DEBUG
+            // Store screenshots: -BridgeWindowSize 1440x900 pins the window (2880 × 1800 on a Retina screen).
+            if let spec = UserDefaults.standard.string(forKey: "BridgeWindowSize") {
+                let parts = spec.split(separator: "x").compactMap { Double($0) }
+                if parts.count == 2 {
+                    let size = CGSize(width: parts[0], height: parts[1])
+                    scene.sizeRestrictions?.minimumSize = size
+                    scene.sizeRestrictions?.maximumSize = size
+                }
+            }
+            #endif
             #endif
         }
     }

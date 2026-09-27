@@ -55,8 +55,14 @@ struct HomeView: View {
             model.refreshSaved()
             if UserDefaults.standard.string(forKey: "BridgeAutoRun") == "browse" || UserDefaults.standard.string(forKey: "BridgeTab") == "camera" { tab = .camera }
             #if DEBUG
+            // Store screenshots: -BridgeDemoCamera X100VI shows a paired body without Bluetooth.
+            if let name = UserDefaults.standard.string(forKey: "BridgeDemoCamera") {
+                model.bluetoothCamera = name
+                model.bluetoothPairedHere = true
+            }
             if UserDefaults.standard.bool(forKey: "BridgeDemoCard") {
                 model.cameraPhotos = DemoCard.photos(from: model.saved)
+                model.selection = Set(model.cameraPhotos.filter { !model.importedNames.contains($0.name) }.prefix(4).map(\.handle))
                 tab = .camera
             }
             #endif
