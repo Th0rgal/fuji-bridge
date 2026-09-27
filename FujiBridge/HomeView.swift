@@ -183,8 +183,8 @@ struct HomeView: View {
         VStack(alignment: .leading, spacing: 16) {
             cameraCard
             if Ink.isMac || UIDevice.current.userInterfaceIdiom == .pad {
-                Rectangle().fill(Ink.rule).frame(height: 1).padding(.vertical, 4)
                 SidebarDetails(saved: model.saved, reportStamp: model.report?.stamp) { model.revealPhotos() }
+                    .padding(.top, 6)
             }
         }
     }

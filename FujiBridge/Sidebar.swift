@@ -100,30 +100,28 @@ struct SidebarDetails: View {
     @State private var runs: [ImportRun] = []
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 22) {
-            section("Library") {
-                row(icon: "photo.on.rectangle", title: library.count == 0 ? "No photos yet" : "\(library.count) photo\(library.count == 1 ? "" : "s")",
-                    detail: library.count == 0 ? (Ink.isMac ? "Pictures › Fuji Bridge" : "Files › Fuji Bridge") : Self.size(library.bytes))
-                if let newest = library.newest {
-                    row(icon: "clock", title: newest, detail: library.newestDate.map { "newest · " + Self.when($0) } ?? "newest")
-                }
-                LinkButton(title: Ink.isMac ? "Show in Finder" : "Open in Files", systemImage: "folder", action: reveal)
-                    .padding(.leading, 30)
+        VStack(alignment: .leading, spacing: 20) {
+            section("Library", action: (Ink.isMac ? "Show in Finder" : "Open in Files", "folder", reveal)) {
+                row(icon: "photo.on.rectangle",
+                    title: library.count == 0 ? "No photos yet" : "\(library.count) photo\(library.count == 1 ? "" : "s")",
+                    value: library.count == 0 ? nil : Self.size(library.bytes),
+                    detail: libraryDetail)
             }
             section("Recent imports") {
                 if runs.isEmpty {
-                    Text("Nothing imported from a camera yet.")
-                        .font(Ink.side(.detail))
-                        .foregroundStyle(Ink.ink2)
+                    row(icon: "tray", title: "No imports yet", detail: "Plug in or wake the camera")
                 }
-                ForEach(runs) { run in
+                ForEach(Array(runs.enumerated()), id: \.element.id) { index, run in
+                    if index > 0 { rule }
                     if run.result.ok {
                         row(icon: "checkmark.circle", tint: Ink.good,
-                            title: run.copied > 0 ? "\(run.copied) new · \(Self.size(run.copiedBytes))" : "Up to date",
+                            title: run.copied > 0 ? "\(run.copied) new" : "Up to date",
+                            value: run.copied > 0 ? Self.size(run.copiedBytes) : nil,
                             detail: [Self.when(run.started), run.over, run.copied > 0 ? String(format: "%.0f MB/s", run.averageMBps) : "\(run.already) already here"].joined(separator: " · "))
                     } else {
                         row(icon: "exclamationmark.triangle", tint: Ink.bad,
-                            title: run.repeats > 1 ? "\(run.repeats) attempts · \(run.why)" : "Stopped · \(run.why)",
+                            title: run.why.prefix(1).uppercased() + run.why.dropFirst(),
+                            value: run.repeats > 1 ? "×\(run.repeats)" : nil,
                             detail: "\(run.repeats > 1 ? "last " : "")\(Self.when(run.started)) · \(run.over)")
                     }
                 }
@@ -138,33 +136,75 @@ struct SidebarDetails: View {
         }
     }
 
-    private func section<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(title)
-                .font(Ink.side(.header))
-                .foregroundStyle(Ink.ink2)
-            content()
+    private var libraryDetail: String {
+        guard library.count > 0 else { return Ink.isMac ? "Pictures › Fuji Bridge" : "Files › Fuji Bridge" }
+        let name = library.newest.map { ($0 as NSString).deletingPathExtension } ?? ""
+        return (["Newest \(name)"] + [library.newestDate.map(Self.when)].compactMap { $0 }).joined(separator: " · ")
+    }
+
+    /// A header and one grouped surface, the same card language as the camera above.
+    private func section<Content: View>(_ title: String, action: (String, String, () -> Void)? = nil, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(title)
+                    .font(Ink.side(.header))
+                    .foregroundStyle(Ink.ink2)
+                Spacer()
+                if let action {
+                    Button(action: action.2) {
+                        Image(systemName: action.1)
+                            .font(.system(size: Ink.isMac ? 12 : 14, weight: .medium))
+                            .foregroundStyle(Ink.ink2)
+                            .frame(width: 26, height: 22)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(InkPress())
+                    .hoverEffect(.highlight)
+                    .help(action.0)
+                    .accessibilityLabel(action.0)
+                }
+            }
+            .padding(.horizontal, 4)
+            VStack(alignment: .leading, spacing: 0) { content() }
+                .background(Ink.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Ink.rule, lineWidth: 1))
         }
     }
 
-    private func row(icon: String, tint: Color = Ink.muted, title: String, detail: String) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
+    private var rule: some View {
+        Rectangle().fill(Ink.rule).frame(height: 1).padding(.leading, 42)
+    }
+
+    private func row(icon: String, tint: Color = Ink.muted, title: String, value: String? = nil, detail: String) -> some View {
+        HStack(alignment: .center, spacing: 10) {
             Image(systemName: icon)
                 .font(.system(size: Ink.isMac ? 13 : 15, weight: .medium))
                 .foregroundStyle(tint)
                 .frame(width: 20)
             VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(Ink.side(.title))
-                    .foregroundStyle(Ink.ink)
-                    .lineLimit(1)
+                HStack(alignment: .firstTextBaseline) {
+                    Text(title)
+                        .font(Ink.side(.title))
+                        .foregroundStyle(Ink.ink)
+                        .lineLimit(1)
+                    Spacer(minLength: 6)
+                    if let value {
+                        Text(value)
+                            .font(Ink.side(.detail))
+                            .monospacedDigit()
+                            .foregroundStyle(Ink.ink2)
+                    }
+                }
                 Text(detail)
                     .font(Ink.side(.detail))
                     .monospacedDigit()
                     .foregroundStyle(Ink.ink2)
                     .lineLimit(1)
+                    .truncationMode(.middle)
             }
         }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
     }
 
     static func size(_ bytes: Int) -> String {
