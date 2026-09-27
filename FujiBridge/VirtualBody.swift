@@ -32,6 +32,10 @@ final class VirtualBody: @unchecked Sendable {
     let faults: Faults
     let control: RunControl
     let frames: [CardFrame]
+    /// Handles removed with DeleteObject, in order.
+    private(set) var deleted: [Int] = []
+    /// Handles the body refuses to delete, like a protected frame on the card (0x200F).
+    var protected: Set<Int> = []
     private(set) var initCount = 0
     private(set) var correctSize: UInt16 = 0
     private var stallArmed: Bool
@@ -40,6 +44,7 @@ final class VirtualBody: @unchecked Sendable {
     private(set) var openTids: [UInt32] = []
     private(set) var partials: [(handle: Int, offset: Int, ask: Int)] = []
     private(set) var compressSmall: UInt16 = 0
+    private(set) var resizeRate: UInt16?
     /// Nil lists the card. An empty array is a body that answered D621 with no handles.
     var listedHandles: [Int]?
     private(set) var infoSeen: [(handle: Int, compress: UInt16, correct: UInt16, reported: Int)] = []
@@ -115,6 +120,16 @@ final class VirtualBody: @unchecked Sendable {
             let payload = propValue(prop)
             return .bytes(Packets.dataPhase(code: code, tid: tid, payload: payload)
                 + Packets.response(code: code, tid: tid))
+        case Fuji.deleteObject:
+            let handle = Int(params.first ?? 0)
+            if protected.contains(handle) {
+                return .bytes(Packets.response(code: code, tid: tid, rc: 0x200f))
+            }
+            guard frames.contains(where: { $0.handle == handle }), !deleted.contains(handle) else {
+                return .bytes(Packets.response(code: code, tid: tid, rc: Fuji.invalidObject))
+            }
+            deleted.append(handle)
+            return .bytes(Packets.response(code: code, tid: tid))
         case Fuji.getObjectInfo:
             let handle = Int(params.first ?? 0)
             guard frames.contains(where: { $0.handle == handle }) else {
@@ -122,6 +137,14 @@ final class VirtualBody: @unchecked Sendable {
             }
             let payload = objectInfo(handle)
             return .bytes(Packets.dataPhase(code: code, tid: tid, payload: payload)
+                + Packets.response(code: code, tid: tid))
+        case Fuji.getObjectPropValue where answersObjectSize && params.count > 1 && params[1] == Fuji.objectSize:
+            guard let frame = frames.first(where: { $0.handle == Int(params[0]) }) else {
+                return .bytes(Packets.response(code: code, tid: tid, rc: Fuji.invalidObject))
+            }
+            var size = Data(count: 8)
+            LE.put32(&size, 0, UInt32(served(frame.bytes)))
+            return .bytes(Packets.dataPhase(code: code, tid: tid, payload: size)
                 + Packets.response(code: code, tid: tid))
         case Fuji.getPartial:
             let handle = Int(params.first ?? 0)
@@ -139,9 +162,11 @@ final class VirtualBody: @unchecked Sendable {
 
     /// Test hook: the next window comes back this short, like a body that answers less than it was asked.
     var shortWindow: Int?
+    /// Test hook: a body without ObjectSize, so the importer has to fall back to D227.
+    var answersObjectSize = true
 
     private func partial(handle: Int, offset: Int, ask: Int, code: UInt16, tid: UInt32) -> Reply {
-        let total = frames.first { $0.handle == handle }?.bytes ?? ask
+        let total = frames.first { $0.handle == handle }.map { served($0.bytes) } ?? ask
         let remain = max(0, total - offset)
         var give = min(ask, remain)
         if let short = shortWindow, short < give {
@@ -201,11 +226,20 @@ final class VirtualBody: @unchecked Sendable {
         if prop == Fuji.compressSmall {
             compressSmall = value
         }
+        if prop == Fuji.resizeRate {
+            resizeRate = value
+        }
+    }
+
+    /// While D226 = 1 the body sends a resized JPEG: an eighth of the file for S, a sixteenth for XS.
+    private func served(_ bytes: Int) -> Int {
+        guard compressSmall == 1 else { return bytes }
+        return max(1, bytes / (resizeRate == 0 ? 16 : 8))
     }
 
     private func objectInfo(_ handle: Int) -> Data {
         let frame = frames.first { $0.handle == handle }
-        let real = frame?.bytes ?? 0
+        let real = served(frame?.bytes ?? 0)
         let reported = (faults.lieAboutSize && correctSize == 0) ? Fuji.liedSize : real
         infoSeen.append((handle, compressSmall, correctSize, reported))
         return ObjectInfo.payload(name: frame?.name ?? "", bytes: reported, maxPartial: Fuji.partialMax)

@@ -15,7 +15,9 @@ Fuji Bridge, compared with the way that session usually dies:
 - polls `0xD212` until `0xDF00` leaves "press OK". That record is not always first; object count is `0xD222`
 - sets client state `0xDF01 = 20` (XApp gallery)
 - reads `0xD621` for the import handles, and only falls back to `1..count` when that list is empty
-- sets `0xD226 = 2` and `0xD227 = 1` before each file, then both back to 0. Until D227 is 1, ObjectInfo reports about 100 KB
+- sets `0xD226 = 2` (XApp's ImageForceCompression: 2 original, 1 resized) once for the whole import and back to 0 at the end, like XApp. The file size comes from `GetObjectPropValue` (`0x9803`) of ObjectSize `0xDC04`, as XApp does; ObjectInfo reports about 100 KB while `0xD227` is 0. A body that does not answer ObjectSize gets libfuji's `0xD227 = 1` instead
+- for a resized import (Import menu › Size over Wi-Fi, S by default), sets `0xD22E` (1 S, 0 XS) and `0xD226 = 1` instead, like XApp's Resize setting, with `0xD227 = 1` so ObjectInfo gives the resized length. A file already here under the same name counts as imported
+- gives each read 30 s once files are moving (XApp's GET_OBJECT_TIMEOUT), so a slow window is not cut and asked again
 - reads `GetPartialObject` (`0x101B`) in 1 MB pieces and resumes from the last offset. `compressed_size` is the unaligned word at offset 13. The filename is a PTP string at offset 52 (length byte, then UTF-16), not raw ASCII.
 
 ## Two modes
@@ -113,8 +115,8 @@ Wide windows (Mac, iPad) put the controls on the left and the photos in a grid f
 No USB cable: Fuji Bridge can find the body over Bluetooth, ask it to start its access point, and join it. `FujiBridge/FujiBluetooth.swift`:
 
 1. Scan for manufacturer data with company id `0x04D8`. A bonded X100VI (firmware 1.32) advertises service `804daa8e…` plus a short serial, e.g. `1D7B8`.
-2. Connect, then identify: secure bodies (X100VI from firmware 1.31, profile `ad14d4` in fffw) read STATUS `f557d96b…` and write it back with its last byte set to `0x20`; older bodies write the 4-byte token from the pairing advert to `aba356eb…`. Then write the client name to `85b9163e…`.
-3. Read the SSID (`bf6dc9cf…`), write `04 00` to `600655e6…` to start the access point, read the password (`e809256a…`), and wait for indication `a68e3f66…`: `01` means up, `00` means busy.
+2. Connect, then identify: secure bodies (X100VI from firmware 1.31, profile `ad14d4` in fffw) read STATUS `f557d96b…` and write it back with its last byte set to `0x20`; older bodies write the 4-byte token from the pairing advert to `aba356eb…`. Then write the client name to `85b9163e…` (CONNECTED_DEVICE_NAME). XApp sends the same name as the device name in the Wi-Fi init packet, with the same version and GUID as ours.
+3. Read the SSID (`bf6dc9cf…`), write the function code `03 00` to `600655e6…` (FUNCTION_LAUNCH_REQUEST; XApp's codes: 1 ImportImage, 3 InCameraViewing, 4 RemoteShooting, 5 UpdateFirmware; XApp sends 3 to import, and `04 00`, which libfuji uses, starts a remote-shooting session that ignores an import client's init), read the password (`e809256a…`), and wait for indication `a68e3f66…`: `01` means up, `00` means busy.
 4. iPhone/iPad: `NEHotspotConfiguration` (hidden, join once) makes iOS ask to join. Mac: no app may join a network there, so Fuji Bridge shows the network and a copy button and waits up to 2 minutes.
 
 On an iPhone already paired with XApp, the bond belongs to iOS, so Fuji Bridge uses it without pairing again. A Mac has no bond: connecting would need the camera's pairing registration, which may make the Mac the camera's pairing destination instead of the phone.

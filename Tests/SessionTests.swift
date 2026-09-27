@@ -118,8 +118,43 @@ final class SessionTests: XCTestCase {
         XCTAssertEqual(body.partials.map(\.offset), [0, 0x10_0000, 0x20_0000])
         XCTAssertEqual(body.partials.map(\.ask), [0x10_0000, 0x10_0000, 302_848])
         XCTAssertEqual(body.infoSeen.first?.compress, 2)
+        // Like XApp: D227 stays 0 and the size comes from ObjectSize.
+        XCTAssertEqual(body.infoSeen.first?.correct, 0)
+        XCTAssertEqual(body.compressSmall, 0)
+    }
+
+    func testBodyWithoutObjectSizeFallsBackToD227() async {
+        let frames = Array(Catalog.roll.prefix(2))
+        let faults = Faults(flakyHandshake: false, requireOk: false, stallChunk: false, lieAboutSize: true, impatientOpen: false)
+        let (result, body, lines) = await observe(.bridge, frames: frames, faults: faults, autoOK: true, objectSize: false)
+        XCTAssertTrue(result.ok)
+        XCTAssertEqual(result.files.map(\.got), frames.map(\.bytes))
+        // The first ObjectInfo lies, D227 goes on once, and every later ObjectInfo is honest.
+        XCTAssertEqual(body.infoSeen.map(\.reported), [102_400, frames[0].bytes, frames[1].bytes])
+        XCTAssertEqual(lines.filter { $0.dir == "OUT" && $0.title == "Set D227 = 1" }.count, 1)
+        XCTAssertEqual(body.correctSize, 0)
+    }
+
+    func testResizedImportAsksTheBodyToShrinkEachFile() async {
+        let frames = Array(Catalog.roll.prefix(2))
+        let control = RunControl()
+        control.ok = true
+        let body = VirtualBody(faults: .none, control: control, frames: frames)
+        var lines: [TraceLine] = []
+        let result = await Importer.run(
+            link: VirtualLink(body: body),
+            options: RunOptions(kind: .bridge, frames: frames, faults: .none, control: control, size: .small),
+            log: { lines.append($0) }
+        )
+        XCTAssertTrue(result.ok)
+        XCTAssertEqual(result.files.map(\.state), ["full", "full"])
+        XCTAssertEqual(result.files.map(\.got), frames.map { $0.bytes / 8 })
+        XCTAssertEqual(body.resizeRate, 1)
+        XCTAssertEqual(body.infoSeen.first?.compress, 1)
         XCTAssertEqual(body.infoSeen.first?.correct, 1)
-        XCTAssertEqual(body.infoSeen.first?.reported, frame.bytes)
+        // Both back to 0 once the import is over.
+        XCTAssertEqual(body.compressSmall, 0)
+        XCTAssertEqual(body.correctSize, 0)
     }
 
     func testReconnectResetsTheTransactionId() async {
@@ -133,7 +168,9 @@ final class SessionTests: XCTestCase {
         XCTAssertEqual(lines.filter { $0.title == "Settle 50 ms" }.count, 2)
         XCTAssertEqual(body.partials[1].offset, Fuji.stallBytes)
         XCTAssertFalse(lines.isEmpty)
-        XCTAssertEqual(body.infoSeen.first?.reported, frame.bytes)
+        // D226 is set once for the import and again after the reconnect, never around each file.
+        XCTAssertEqual(lines.filter { $0.dir == "OUT" && $0.title == "Set D226 = 2" }.count, 2)
+        XCTAssertEqual(lines.filter { $0.dir == "OUT" && $0.title == "Set D227 = 1" }.count, 0)
     }
 
     func testLiveDiscoveryUsesD621NotARange() async {
@@ -347,13 +384,15 @@ final class SessionTests: XCTestCase {
         autoOK: Bool,
         live: Bool = false,
         listed: [Int]? = nil,
-        aborted: Bool = false
+        aborted: Bool = false,
+        objectSize: Bool = true
     ) async -> (RunResult, VirtualBody, [TraceLine]) {
         let control = RunControl()
         control.ok = autoOK
         control.aborted = aborted
         let body = VirtualBody(faults: faults, control: control, frames: bodyFrames ?? frames)
         body.listedHandles = listed
+        body.answersObjectSize = objectSize
         let link = VirtualLink(body: body)
         var lines: [TraceLine] = []
         let result = await Importer.run(

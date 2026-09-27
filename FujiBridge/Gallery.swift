@@ -280,18 +280,20 @@ struct LocalTile: View {
     var selected = false
     @State private var image: UIImage?
     @State private var failed = false
+    /// Read once with the thumbnail, not from disk on every redraw (a selection change redraws every tile).
+    @State private var size = ""
 
     var body: some View {
         PhotoTile(image: image, title: url.lastPathComponent, caption: size, selected: selected, failed: failed) { EmptyView() }
             .task(id: url) {
+                let path = url.path
+                size = await Task.detached(priority: .utility) {
+                    let bytes = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber)?.intValue ?? 0
+                    return ByteFormat.string(bytes)
+                }.value
                 image = await Thumbnails.shared.image(for: url)
                 failed = image == nil
             }
-    }
-
-    private var size: String {
-        let bytes = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue ?? 0
-        return ByteFormat.string(bytes)
     }
 }
 
@@ -366,7 +368,12 @@ private struct SelectableTile: ViewModifier {
     func body(content: Content) -> some View {
         let single = TapGesture().onEnded { click(ModifierKeys.kind) }
         if Ink.isMac, let open {
-            return AnyView(content.gesture(TapGesture(count: 2).onEnded { open() }.exclusively(before: single)))
+            // Finder's order: the first click selects at once, a second one opens. An exclusive double-tap made
+            // every single click wait out the double-click interval (~250 ms) before selecting anything.
+            // A plain click replaces the selection, so the second click of a double-click changes nothing.
+            return AnyView(content
+                .gesture(single)
+                .simultaneousGesture(TapGesture(count: 2).onEnded { open() }))
         }
         return AnyView(content.gesture(single))
     }
@@ -416,14 +423,23 @@ enum ModifierKeys {
 }
 
 enum CaptureDate {
-    /// "20260924T195324" to "24 Sep 19:53".
-    static func short(_ raw: String?) -> String? {
-        guard let raw, raw.count >= 13 else { return nil }
+    /// Every camera tile asks on every redraw. A DateFormatter per call cost more than the rest of the tile.
+    private static let parser: DateFormatter = {
         let parser = DateFormatter()
         parser.locale = Locale(identifier: "en_US_POSIX")
         parser.dateFormat = "yyyyMMdd'T'HHmmss"
+        return parser
+    }()
+    private static let memo = NSCache<NSString, NSString>()
+
+    /// "20260924T195324" to "24 Sep 19:53".
+    static func short(_ raw: String?) -> String? {
+        guard let raw, raw.count >= 13 else { return nil }
+        if let hit = memo.object(forKey: raw as NSString) { return hit as String }
         guard let date = parser.date(from: String(raw.prefix(15))) else { return nil }
-        return date.formatted(.dateTime.day().month(.abbreviated).hour().minute())
+        let text = date.formatted(.dateTime.day().month(.abbreviated).hour().minute())
+        memo.setObject(text as NSString, forKey: raw as NSString)
+        return text
     }
 }
 

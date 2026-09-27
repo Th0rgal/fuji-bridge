@@ -139,6 +139,49 @@ final class LoopbackTests: XCTestCase {
         XCTAssertTrue(recorder.lines.contains { $0.title == "Reconnect" && $0.op == "reconnect" })
     }
 
+    func testLoadMoreListsTheOlderFramesAndReportsTheCard() async throws {
+        let camera = LoopbackCamera(body: VirtualBody(faults: .none, control: RunControl(), frames: frames))
+        let port = try await camera.start()
+        defer { camera.stop() }
+        let control = RunControl()
+        control.ok = true
+        let listed = Box<[String]>([])
+        let total = Box<Int>(0)
+        let result = await Importer.run(
+            link: TCPLink(host: "127.0.0.1", port: port, connectTimeout: 2, readTimeout: 2),
+            options: RunOptions(kind: .bridge, frames: [], faults: .none, control: control, live: true, host: "127.0.0.1",
+                                latest: 1, skipNewest: 1, cardCount: { total.value = $0 },
+                                preview: { listed.value.append($0.name) }),
+            log: Recorder().add
+        )
+        XCTAssertTrue(result.ok, result.summary)
+        // Two frames on the card, the newest already shown: the next page is the older one only.
+        XCTAssertEqual(total.value, 2)
+        XCTAssertEqual(listed.value, ["DSCF4436.JPG"])
+    }
+
+    func testDeleteRemovesTheFramesAndNamesARefusal() async throws {
+        let body = VirtualBody(faults: .none, control: RunControl(), frames: frames)
+        body.protected = [9]
+        let camera = LoopbackCamera(body: body)
+        let port = try await camera.start()
+        defer { camera.stop() }
+        let control = RunControl()
+        control.ok = true
+        let result = await Importer.run(
+            link: TCPLink(host: "127.0.0.1", port: port, connectTimeout: 2, readTimeout: 2),
+            options: RunOptions(kind: .bridge, frames: [], faults: .none, control: control, live: true, host: "127.0.0.1",
+                                only: [4, 9], delete: true),
+            log: Recorder().add
+        )
+        // One deleted, the protected one refused and said so; nothing was copied.
+        XCTAssertEqual(body.deleted, [4])
+        XCTAssertEqual(Set(result.files.map(\.state)), ["deleted", "refused"])
+        XCTAssertEqual(result.reason, "delete-refused")
+        XCTAssertTrue(result.summary.contains("protected"), result.summary)
+        XCTAssertTrue(body.partials.isEmpty)
+    }
+
     func testNothingListeningFailsFastWithAReason() async throws {
         // Grab a free port, then close it, so the connect is refused.
         let camera = LoopbackCamera(body: VirtualBody(faults: .none, control: RunControl(), frames: []))
@@ -198,4 +241,14 @@ private final class Recorder: @unchecked Sendable {
     private var store: [TraceLine] = []
     var lines: [TraceLine] { lock.lock(); defer { lock.unlock() }; return store }
     func add(_ line: TraceLine) { lock.lock(); store.append(line); lock.unlock() }
+}
+
+private final class Box<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: T
+    init(_ value: T) { stored = value }
+    var value: T {
+        get { lock.lock(); defer { lock.unlock() }; return stored }
+        set { lock.lock(); stored = newValue; lock.unlock() }
+    }
 }

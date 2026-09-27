@@ -10,7 +10,7 @@ final class TCPLink: ByteLink, @unchecked Sendable {
     private let host: String
     private let port: UInt16
     private let connectTimeout: TimeInterval
-    private let readTimeout: TimeInterval
+    private var readTimeout: TimeInterval
     private var connection: NWConnection?
     private var buffer = Data()
     private let queue = DispatchQueue(label: "md.thomas.fujibridge.tcp")
@@ -32,6 +32,10 @@ final class TCPLink: ByteLink, @unchecked Sendable {
 
     func observe(_ sink: @escaping @Sendable (String, String) -> Void) {
         self.sink = sink
+    }
+
+    func setReadTimeout(_ seconds: TimeInterval) {
+        readTimeout = seconds
     }
 
     func open() async throws {

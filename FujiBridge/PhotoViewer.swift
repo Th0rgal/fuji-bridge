@@ -34,6 +34,8 @@ struct PhotoViewer: View {
     let move: (Int) -> Void
     let toggle: () -> Void
     let close: () -> Void
+    /// Asks to delete a frame from the card (the caller confirms first).
+    var deleteFromCamera: ((Int) -> Void)? = nil
 
     @State private var image: UIImage?
     @State private var sharp = false
@@ -86,6 +88,12 @@ struct PhotoViewer: View {
             Spacer(minLength: 8)
             if case .camera(let photo) = item {
                 fullSizeControl(photo)
+                if let deleteFromCamera {
+                    Button { deleteFromCamera(photo.handle) } label: { Image(systemName: "trash") }
+                        .buttonStyle(.plain)
+                        .disabled(model.busy)
+                        .help("Delete from the camera")
+                }
             }
             if case .local(let url) = item {
                 ShareLink(item: url) { Image(systemName: "square.and.arrow.up") }

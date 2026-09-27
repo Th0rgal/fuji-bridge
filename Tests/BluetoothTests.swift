@@ -10,6 +10,8 @@ final class FakeFujiGATT: GATTClient, @unchecked Sendable {
     var password = Data("s3cretpass".utf8) + Data(count: 10)
     var answer: Data? = Data([0x01, 0x00])
     var stale: Data? = nil
+    /// Answer 00 (busy) this many times before the real answer.
+    var busyFirst = 0
     /// Reads of STATUS that fail like macOS does while the user compares the pairing code.
     var pendingPairing = 0
     private(set) var steps: [String] = []
@@ -49,7 +51,12 @@ final class FakeFujiGATT: GATTClient, @unchecked Sendable {
         }
         steps.append("wait \(name(characteristic))")
         // Only the answer after the wake counts.
-        return written[FujiBLE.wifiWake] == nil ? nil : answer
+        guard written[FujiBLE.wifiWake] != nil else { return nil }
+        if busyFirst > 0 {
+            busyFirst -= 1
+            return Data([0x00, 0x00])
+        }
+        return answer
     }
 
     private func name(_ uuid: CBUUID) -> String {
@@ -100,13 +107,17 @@ final class BluetoothTests: XCTestCase {
         gatt.stale = Data([0x00, 0x00])
         let wifi = try await FujiWake.run(gatt, token: nil) { _, _ in }
         XCTAssertEqual(wifi, CameraWifi(ssid: "FUJIFILM-X100VI-1D7B8", password: "s3cretpass"))
-        XCTAssertEqual(gatt.steps, [
+        let subscriptions = gatt.steps.filter { $0.hasPrefix("subscribe ") }
+        XCTAssertEqual(gatt.steps.filter { !$0.hasPrefix("subscribe ") }, [
             "read status", "write status", "write identity",
-            "subscribe ind1", "subscribe ind2", "subscribe not1", "subscribe ssid",
             "read ssid", "write wake", "read password", "wait ind1",
         ])
+        // Every notification libfuji listens to, in its order, before the SSID read and the wake.
+        XCTAssertEqual(subscriptions.count, FujiBLE.subscriptions.count)
+        XCTAssertEqual(Array(subscriptions.prefix(3)), ["subscribe ind1", "subscribe ind2", "subscribe not1"])
+        XCTAssertLessThan(gatt.steps.lastIndex { $0.hasPrefix("subscribe ") } ?? 99, gatt.steps.firstIndex(of: "read ssid") ?? 0)
         XCTAssertEqual(gatt.written[FujiBLE.secureStatus], Data([0x07, 0x96, 0x00, 0x20]))
-        XCTAssertEqual(gatt.written[FujiBLE.wifiWake], Data([0x04, 0x00]))
+        XCTAssertEqual(gatt.written[FujiBLE.wifiWake], Data([0x03, 0x00]))
         XCTAssertEqual(gatt.written[FujiBLE.identity], Data("Fuji Bridge".utf8))
     }
 
@@ -132,6 +143,14 @@ final class BluetoothTests: XCTestCase {
         _ = try await FujiWake.run(gatt, token: Data([1, 2, 3, 4])) { _, _ in }
         XCTAssertEqual(gatt.steps.prefix(2), ["write token", "write identity"])
         XCTAssertEqual(gatt.written[FujiBLE.basicToken], Data([1, 2, 3, 4]))
+    }
+
+    func testABusyAnswerIsAskedAgainLikeXApp() async throws {
+        let gatt = FakeFujiGATT()
+        gatt.busyFirst = 1
+        let wifi = try await FujiWake.run(gatt, token: nil) { _, _ in }
+        XCTAssertEqual(wifi.ssid, "FUJIFILM-X100VI-1D7B8")
+        XCTAssertEqual(gatt.steps.filter { $0 == "write wake" }.count, 2)
     }
 
     func testABusyCameraIsReported() async {

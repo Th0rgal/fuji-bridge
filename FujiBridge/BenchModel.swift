@@ -42,6 +42,8 @@ enum Purpose: Equatable {
     case browse
     /// One frame into the cache, to look at full size.
     case open(Int)
+    /// These frames off the card, for good.
+    case delete(Set<Int>)
 }
 
 @MainActor
@@ -55,7 +57,9 @@ final class BenchModel {
     var files: [FileResult] = []
     var compare: [CompareRow] = []
     var selected: Set<Int> = Set(Catalog.roll.map(\.handle))
-    var saved: [URL] = []
+    var saved: [URL] = [] {
+        didSet { if saved != oldValue { importedNames = Set(saved.map(\.lastPathComponent)) } }
+    }
     var busy = false
     var waiting = false
     var progress: LiveProgress?
@@ -70,6 +74,18 @@ final class BenchModel {
     var purpose: Purpose = .newPhotos
     /// The card as the last browse saw it, newest first.
     var cameraPhotos: [CardPhoto] = []
+    /// How many frames the card holds, as the last listing reported it. Nil until the camera has been browsed.
+    var cardTotal: Int?
+    /// Set by `browseMore`: the next listing continues below what is on screen instead of replacing it.
+    private var browseSkip = 0
+    /// Page size for "Load more", remembered.
+    var browsePage: Int = UserDefaults.standard.object(forKey: "BridgeBrowsePage") as? Int ?? 100 {
+        didSet { UserDefaults.standard.set(browsePage, forKey: "BridgeBrowsePage") }
+    }
+    /// True while a listing runs with no limit: the grid keeps filling until the card is done or Stop.
+    var browsingAll = false
+    /// Frames on the card that are not listed yet.
+    var cardRemaining: Int? { cardTotal.map { max($0 - cameraPhotos.count, 0) } }
     var selection: Set<Int> = []
     /// The photo open in the viewer, if any: which grid it comes from and its id there.
     var viewer: Viewer?
@@ -97,11 +113,17 @@ final class BenchModel {
     /// the join declined, Local Network denied…). Replaces the generic "camera not reachable".
     var stopHint: StopHint?
     /// Names already in the photos folder, to mark frames on the camera that are here.
-    var importedNames: Set<String> { Set(saved.map(\.lastPathComponent)) }
+    /// Names in the library, kept with `saved`. Every camera tile asks it on every redraw: rebuilding the set
+    /// per call made a click on a 1,800-frame card cost hundreds of thousands of allocations.
+    private(set) var importedNames: Set<String> = []
     var scope: Scope = Scope(rawValue: UserDefaults.standard.object(forKey: "BridgeScope") as? Int ?? 25) ?? .latest25 {
         didSet { UserDefaults.standard.set(scope.rawValue, forKey: "BridgeScope") }
     }
     /// Camera address. 192.168.0.1 on the body's own Wi-Fi; a Mac running tools/fakecam.py for rehearsals.
+    /// Wi-Fi imports only: resized by the camera (S by default, the radio is slow), or originals.
+    var importSize: ImportSize = ImportSize(rawValue: UserDefaults.standard.string(forKey: "BridgeImportSize") ?? "") ?? .small {
+        didSet { UserDefaults.standard.set(importSize.rawValue, forKey: "BridgeImportSize") }
+    }
     var host: String = UserDefaults.standard.string(forKey: "BridgeHost") ?? Fuji.cameraHost {
         didSet { UserDefaults.standard.set(host, forKey: "BridgeHost") }
     }
@@ -173,9 +195,30 @@ final class BenchModel {
     }
 
     /// Fills the preview grid with the newest frames in scope. Optional: imports never need it.
+    /// Deletes these frames from the card. The caller has already asked the user; nothing here can be undone.
+    func deleteFromCamera(_ handles: Set<Int>) {
+        guard !handles.isEmpty else { return }
+        start(.bridge, mode: .camera, transport: transport, purpose: .delete(handles))
+    }
+
     func browse() {
+        browseSkip = 0
+        browsingAll = scope == .all
         start(.bridge, mode: .camera, transport: transport, purpose: .browse)
     }
+
+    /// Lists further back into the card, below what is already on screen. Nil lists everything left, and the
+    /// grid keeps filling as each thumbnail arrives ("load continuously").
+    func browseMore(_ count: Int?) {
+        guard !busy else { return }
+        browseSkip = cameraPhotos.count
+        browsingAll = count == nil
+        browseLimit = count
+        start(.bridge, mode: .camera, transport: transport, purpose: .browse)
+    }
+
+    /// Nil: the import scope decides (first browse). Set by `browseMore` for one run.
+    private var browseLimit: Int?? = nil
 
     /// The frame's full-size copy in the cache, when an earlier look already fetched it whole.
     func cachedFullSize(_ photo: CardPhoto) -> URL? {
@@ -246,7 +289,7 @@ final class BenchModel {
         guard !busy else { return }
         self.mode = mode
         self.purpose = purpose
-        if purpose == .browse { cameraPhotos = [] }
+        if purpose == .browse && browseSkip == 0 { cameraPhotos = [] }
         runTransport = mode == .camera ? transport : .wifi
         runStarted = Date()
         control = RunControl()
@@ -263,14 +306,24 @@ final class BenchModel {
         switch purpose {
         case .selected(let handles): only = handles
         case .open(let handle): only = [handle]
+        case .delete(let handles): only = handles
         default: only = nil
         }
         var preview: (@Sendable (CardPhoto) -> Void)?
+        var cardCount: (@Sendable (Int) -> Void)?
         if purpose == .browse {
+            // The camera sends each batch oldest first. A first listing grows from the top; a "load more" batch
+            // is older than everything shown, so it grows from the bottom of what is there.
+            let base = browseSkip
+            let known = Set(cameraPhotos.map(\.handle))
             preview = { [weak self] photo in
                 Task { @MainActor [weak self] in
-                    self?.cameraPhotos.insert(photo, at: 0)
+                    guard let self, !known.contains(photo.handle) else { return }
+                    self.cameraPhotos.insert(photo, at: min(base, self.cameraPhotos.count))
                 }
+            }
+            cardCount = { [weak self] count in
+                Task { @MainActor [weak self] in self?.cardTotal = count }
             }
         }
         let faults = self.faults
@@ -279,6 +332,10 @@ final class BenchModel {
         let host = self.host.trimmingCharacters(in: .whitespaces)
         let control = self.control
         var latest = scope == .all ? nil : scope.rawValue
+        let skipNewest = purpose == .browse ? browseSkip : 0
+        if purpose == .browse, let limit = browseLimit { latest = limit }
+        browseLimit = nil
+        browseSkip = 0
         #if DEBUG
         let override = UserDefaults.standard.integer(forKey: "BridgeLatest")
         if override > 0 { latest = override }
@@ -288,6 +345,7 @@ final class BenchModel {
         switch purpose {
         case .browse: use = "browse"
         case .open: use = "open"
+        case .delete: use = "delete"
         default: use = "import"
         }
         let session = SessionLog(label: mode == .camera ? "\(transport.rawValue)-\(use)" : "virtual-\(kind.rawValue)")
@@ -332,6 +390,7 @@ final class BenchModel {
                 // A rehearsal against tools/fakecam.py (loopback) must never land in the real photo library.
                 let rehearsal = transport == .wifi && (host.hasPrefix("127.") || host == "localhost")
                 let dir = opening ? Self.previewFolder() : (rehearsal ? Self.rehearsalFolder() : Self.folder())
+                liveLibrary = !opening && !rehearsal
                 result = await Importer.run(
                     link: link,
                     options: RunOptions(
@@ -345,10 +404,20 @@ final class BenchModel {
                         host: host,
                         transport: transport,
                         latest: latest,
+                        skipNewest: skipNewest,
+                        cardCount: cardCount,
                         only: only,
                         preview: preview,
                         progress: progress,
-                        clockOrigin: session.origin
+                        clockOrigin: session.origin,
+                        delete: { if case .delete = purpose { return true } else { return false } }(),
+                        transferTimeout: 30,
+                        size: {
+                            switch purpose {
+                            case .newPhotos, .selected: return importSize
+                            default: return .original
+                            }
+                        }()
                     ),
                     log: log
                 )
@@ -370,23 +439,34 @@ final class BenchModel {
                 if case .selected = purpose {
                     selection.subtract(result.files.filter { $0.state == "full" || $0.state == "already" }.map(\.handle))
                 }
+                if case .delete = purpose {
+                    let gone = Set(result.files.filter { $0.state == "deleted" }.map(\.handle))
+                    cameraPhotos.removeAll { gone.contains($0.handle) }
+                    selection.subtract(gone)
+                    if let total = cardTotal { cardTotal = max(total - gone.count, 0) }
+                    if let viewer, viewer.tab == .camera, cameraPhotos.contains(where: { "camera-\($0.handle)" == viewer.id }) == false {
+                        self.viewer = nil
+                    }
+                }
             }
             files = result.files.filter { ($0.state != "skipped" && $0.state != "lost") || $0.got > 0 }
             if result.reason == "still-waiting" {
                 phase = "Waiting for OK"
             } else {
-                phase = result.ok ? "Copied" : "Stopped"
+                phase = result.ok ? (result.reason == "deleted" ? "Deleted" : "Copied") : "Stopped"
                 waiting = false
             }
             summary = result.summary
             if !result.ok, let bleFailure { summary = "Bluetooth: \(bleFailure) Then Wi-Fi: \(result.summary)" }
             if !result.ok && mode != .virtual && transport == .wifi {
                 stopHint = Self.hint(ble: bleError, localNetworkDenied: lastLocalNetworkDenied)
+                    ?? Self.silentCameraHint(result)
             }
             joinByHand = false
             pairingRequested = false
             if result.reason != "still-waiting" {
                 busy = false
+                browsingAll = false
                 self.progress = nil
             }
             let label = mode == .virtual ? "Virtual body" : (transport == .usb ? "Camera USB" : "Camera Wi-Fi")
@@ -413,13 +493,32 @@ final class BenchModel {
         saved = Self.photos()
     }
 
+    /// Trace time of the first OK poll in the current wait.
+    @ObservationIgnored private var okWaitSince: Double?
+    /// The running import saves into the library, so its files belong in Imported.
+    @ObservationIgnored private var liveLibrary = false
+
     private func receive(_ line: TraceLine) {
         lines.append(line)
         guard mode == .camera, busy else { return }
+        if line.op != "ok-wait" { okWaitSince = nil }
+        if liveLibrary, line.op == "save", line.title.hasPrefix("Saved ") {
+            // Show each photo in Imported as soon as it lands, not when the whole run ends.
+            let url = Self.folder().appendingPathComponent(line.detail)
+            if !importedNames.contains(url.lastPathComponent) {
+                let at = saved.firstIndex { $0.lastPathComponent < url.lastPathComponent } ?? saved.endIndex
+                saved.insert(url, at: at)
+            }
+        }
         switch line.op {
         case "connect", "init", "open": phase = runTransport == .usb ? "Opening the camera" : "Connecting"
         case "net" where line.title == "Catalog ready" || line.title == "Catalog still loading": phase = "Reading the card"
-        case "ok-wait": phase = "Press OK on the camera"
+        case "ok-wait":
+            // The X100VI usually lets the session through by itself: only ask for OK once the poll has
+            // seen the rear screen locked for a couple of seconds.
+            let since = okWaitSince ?? line.ms
+            okWaitSince = since
+            if line.title == "DF00 = 0" && line.ms - since > 2000 { phase = "Press OK on the camera" }
         case "setup", "setup-total", "thumb": phase = "Reading the card"
         case "prep", "info", "partial", "save", "file": phase = "Copying"
         case "reconnect": phase = "Reconnecting"
@@ -495,6 +594,14 @@ final class BenchModel {
         default:
             return nil
         }
+    }
+
+    /// The socket opened but the body never answered the init, or shut its server during the retries
+    /// (seen 27 Sept on an X100VI whose Wi-Fi was already up). Not "unreachable": the camera is right there.
+    static func silentCameraHint(_ result: RunResult) -> StopHint? {
+        guard result.summary.hasPrefix("Init read failed") || result.summary.hasPrefix("Reconnect failed") else { return nil }
+        return StopHint(symbol: "camera", title: "The camera did not answer",
+                        detail: "Switch it off and on, then import again. If it keeps happening, share the report from Diagnostics.")
     }
 
     /// Keeps the screen on and asks for background time, so a locked phone or a sleeping Mac does not kill the socket mid-file.

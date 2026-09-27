@@ -28,21 +28,44 @@ enum FujiBLE {
     static let indication1 = CBUUID(string: "a68e3f66-0fcc-4395-8d4c-aa980b5877fa")
     static let indication2 = CBUUID(string: "bd17ba04-b76b-4892-a545-b73ba1f74dae")
     static let notification1 = CBUUID(string: "f9150137-5d40-4801-a8dc-f7fc5b01da50")
+    static let geotagUpdate = CBUUID(string: "ad06c7b7-f41a-46f4-a29a-712055319122")
+    static let notification6 = CBUUID(string: "e6692c5c-b7cd-44f4-95fc-eda07ce32560")
+    /// In the service bonded bodies advertise (804daa8e…), not discovered until now.
+    static let notification3 = CBUUID(string: "7170fd5a-56d9-4c19-b043-7a7047d8e1a0")
 
     static let wifiService = CBUUID(string: "4e941240-d01d-46b9-a5ea-67636806830b")
     static let ssid = CBUUID(string: "bf6dc9cf-3606-4ec9-a4c8-d77576e93ea4")
     static let password = CBUUID(string: "e809256a-915c-4967-92e8-53b7d4cad213")
+    static let notification5 = CBUUID(string: "75823784-fbb7-4b71-abae-cd9a34072e3c")
+    static let notification7 = CBUUID(string: "aab609c4-94dd-4d89-bc60-665d5090b828")
+    static let notification8 = CBUUID(string: "2a125640-706d-4dd1-b420-c0f4ab93c361")
+    static let notification9 = CBUUID(string: "82a9f452-c5ce-4ef5-8203-3fc9a47f8171")
+    static let notification10 = CBUUID(string: "deef7187-3f43-4364-9e22-11a8c8a15951")
+    static let geotagInterval = CBUUID(string: "c95d91ae-b247-4d6d-8661-7dd5d6a0f85b")
 
     static let shutterService = CBUUID(string: "6514eb81-4e8f-458d-aa2a-e691336cdfac")
-    /// Writing 04 00 here starts the camera's access point.
+    /// FUNCTION_LAUNCH_REQUEST in XApp (com.fujifilm.xapp 2.2.1, BTConstans.kt). A little-endian function code:
+    /// 1 ImportImage, 3 InCameraViewing, 4 RemoteShooting, 5 UpdateFirmware. The body starts its access point
+    /// for that function and answers on AP_STATE (a68e3f66).
     static let wifiWake = CBUUID(string: "600655e6-3637-42f1-8fb2-44efc5c63b13")
+    /// XApp asks for InCameraViewing (3) when the user imports images (CameraConnectActivity.initBLE, and its
+    /// retry after a "camera busy" answer). libfuji's 04 00 is RemoteShooting: the body then starts its Wi-Fi for
+    /// a remote session and never answers an image-viewing client's init (seen on an X100VI, 27 Sept).
+    static let importFunction = Data([0x03, 0x00])
 
     /// Advertised by a secure body in pairing mode.
     static let securePairingAdvert = CBUUID(string: "a9d2b304-e8d6-4902-8336-352b772d7597")
     /// Advertised by a bonded body looking for its phone (seen on an X100VI, firmware 1.32).
     static let reconnectAdvert = CBUUID(string: "804daa8e-ffeb-4ab3-8e75-6edd7303208d")
 
-    static let services: [CBUUID] = [securePairService, basicPairService, configService, wifiService, shutterService]
+    static let services: [CBUUID] = [securePairService, basicPairService, configService, wifiService, shutterService, reconnectAdvert]
+
+    /// What libfuji subscribes to on a secure body, in its order (lib/bluetooth.c, fuji_connect_bluetooth).
+    /// XApp listens to all of these; a body may wait for its client to listen before it serves the Wi-Fi session.
+    static let subscriptions: [CBUUID] = [
+        indication1, indication2, notification1, geotagUpdate, notification3, ssid,
+        notification5, notification6, notification7, notification8, notification9, notification10, geotagInterval,
+    ]
 }
 
 /// What a Fujifilm advertisement says about the body.
@@ -144,7 +167,8 @@ protocol GATTClient: AnyObject {
 enum FujiWake {
     static let clientName = "Fuji Bridge"
 
-    /// Identify (secure or basic), subscribe, read the SSID, write 04 00, read the password, wait for 01.
+    /// Identify (secure or basic), subscribe, read the SSID, ask for the import function (03 00), read the
+    /// password, wait for 01 on AP_STATE.
     static func run(_ gatt: GATTClient, token: Data?, log: (String, String) -> Void) async throws -> CameraWifi {
         if await gatt.has(FujiBLE.secureStatus) {
             let status = try await readThroughPairing(gatt, FujiBLE.secureStatus, log: log)
@@ -158,25 +182,34 @@ enum FujiWake {
         try await gatt.write(FujiBLE.identity, Data(clientName.utf8))
         log("Identified", clientName)
 
-        for characteristic in [FujiBLE.indication1, FujiBLE.indication2, FujiBLE.notification1, FujiBLE.ssid] {
+        for characteristic in FujiBLE.subscriptions {
             await gatt.subscribe(characteristic)
         }
 
         let ssid = text(try await gatt.read(FujiBLE.ssid))
         log("SSID", ssid)
-        // Drop any indication from before the wake: only the answer to 04 00 counts.
+        // Drop any indication from before the wake: only the answer to the launch request counts.
         _ = await gatt.nextValue(FujiBLE.indication1, timeout: 0)
-        try await gatt.write(FujiBLE.wifiWake, Data([0x04, 0x00]))
-        log("Wi-Fi wake sent", "04 00")
+        try await gatt.write(FujiBLE.wifiWake, FujiBLE.importFunction)
+        log("Wi-Fi wake sent", "03 00 (InCameraViewing, as XApp does for an import)")
         let password = (try? await gatt.read(FujiBLE.password)).map(text) ?? ""
         log("Password", password.isEmpty ? "none" : "\(password.count) characters")
 
-        // The body answers on indication 1 a few seconds later: 01 is up, 00 is busy.
-        if let answer = await gatt.nextValue(FujiBLE.indication1, timeout: 12) {
+        // The body answers on indication 1 a few seconds later: 01 is up, 00 is busy. XApp treats a busy
+        // answer as "the camera is in the middle of something": it waits 200 ms and asks again.
+        var busyAnswers = 0
+        while true {
+            guard let answer = await gatt.nextValue(FujiBLE.indication1, timeout: 12) else {
+                log("Wi-Fi answer", "none within 12 s, trying anyway")
+                break
+            }
             log("Wi-Fi answer", hex(answer))
-            if answer.first == 0x00 { throw BLEError.busy }
-        } else {
-            log("Wi-Fi answer", "none within 12 s, trying anyway")
+            guard answer.first == 0x00 else { break }
+            busyAnswers += 1
+            if busyAnswers >= 3 { throw BLEError.busy }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            try await gatt.write(FujiBLE.wifiWake, FujiBLE.importFunction)
+            log("Wi-Fi wake sent", "again after a busy answer (\(busyAnswers))")
         }
         guard !ssid.isEmpty else { throw BLEError.missing(FujiBLE.ssid) }
         return CameraWifi(ssid: ssid, password: password)

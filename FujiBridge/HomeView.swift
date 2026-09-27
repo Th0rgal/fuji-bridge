@@ -18,6 +18,8 @@ struct HomeView: View {
     @State private var cameraAnchor: Int?
     @State private var ratios: [URL: CGFloat] = [:]
     @State private var confirmDelete = false
+    /// Frames the user asked to delete from the card, waiting for the confirmation.
+    @State private var cameraDeleteTarget: Set<Int>?
     /// Mac only: the sidebar's Diagnostics row pushes onto the detail column.
     @State private var showDiagnostics = false
     /// On the phone the camera card and the tab header scroll with the grid: their height, so an empty
@@ -37,6 +39,14 @@ struct HomeView: View {
             Button("Delete", role: .destructive) { deletePicked() }
         } message: {
             Text(Ink.isMac ? "They go to the Trash. The camera keeps its copy." : "They are removed from Fuji Bridge. The camera keeps its copy.")
+        }
+        .confirmationDialog(cameraDeleteTitle, isPresented: Binding(get: { cameraDeleteTarget != nil }, set: { if !$0 { cameraDeleteTarget = nil } }), titleVisibility: .visible) {
+            Button("Delete from Camera", role: .destructive) {
+                if let target = cameraDeleteTarget { model.deleteFromCamera(target) }
+                cameraDeleteTarget = nil
+            }
+        } message: {
+            Text(cameraDeleteMessage)
         }
         .alert("Could not delete", isPresented: Binding(get: { deleteError != nil }, set: { if !$0 { deleteError = nil } })) {
             Button("OK", role: .cancel) {}
@@ -66,7 +76,9 @@ struct HomeView: View {
             }
             if UserDefaults.standard.bool(forKey: "BridgeDemoCard") {
                 model.cameraPhotos = DemoCard.photos(from: model.saved)
-                model.selection = Set(model.cameraPhotos.filter { !model.importedNames.contains($0.name) }.prefix(4).map(\.handle))
+                if !UserDefaults.standard.bool(forKey: "BridgeDemoNoSelection") {
+                    model.selection = Set(model.cameraPhotos.filter { !model.importedNames.contains($0.name) }.prefix(4).map(\.handle))
+                }
                 tab = .camera
             }
             #endif
@@ -109,6 +121,7 @@ struct HomeView: View {
                             diagnostics
                         } label: {
                             Label("Diagnostics", systemImage: diagnosticsIcon)
+                                .foregroundStyle(diagnosticsTint)
                         }
                     }
                 }
@@ -163,8 +176,12 @@ struct HomeView: View {
         DiagnosticsView(report: model.report, files: model.reportFiles, model: model)
     }
 
-    private var diagnosticsIcon: String {
-        (model.report?.findings.contains { $0.severity != "info" } ?? false) ? "stethoscope.circle.fill" : "stethoscope"
+    /// One clean stroke: the stethoscope's ring read as a second circle inside the round iOS 26 toolbar button,
+    /// and its .circle.fill variant stacked a circle in a circle. Warnings change the color, not the shape.
+    private var diagnosticsIcon: String { "waveform.path.ecg" }
+
+    private var diagnosticsTint: Color {
+        (model.report?.findings.contains { $0.severity != "info" } ?? false) ? Ink.bad : Ink.ink
     }
 
     private var sidebarFooter: some View {
@@ -173,6 +190,7 @@ struct HomeView: View {
             Button { showDiagnostics = true } label: {
                 HStack(spacing: 8) {
                     Image(systemName: diagnosticsIcon)
+                        .foregroundStyle(diagnosticsTint == Ink.bad ? Ink.bad : Ink.ink2)
                     Text("Diagnostics")
                     Spacer()
                     Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold)).foregroundStyle(Ink.muted)
@@ -357,6 +375,15 @@ struct HomeView: View {
                             ForEach(Scope.allCases) { Text($0.label).tag($0) }
                         }
                         .pickerStyle(.inline)
+                        Section("Size over Wi-Fi") {
+                            Picker("Size over Wi-Fi", selection: $model.importSize) {
+                                ForEach(ImportSize.allCases) { size in
+                                    Text(size == .small ? "Resized S (recommended)" : size.label).tag(size)
+                                }
+                            }
+                            .pickerStyle(.inline)
+                            .labelsHidden()
+                        }
                     } label: {
                         HStack(spacing: 3) {
                             Text(scopeShort).font(Ink.side(.title, .semibold)).monospacedDigit()
@@ -370,7 +397,7 @@ struct HomeView: View {
                     .buttonStyle(.plain)
                     .menuIndicator(.hidden)
                     .fixedSize()
-                    .help("How much of the card to look at")
+                    .help("How much of the card to look at, and at what size")
                 }
             }
             .foregroundStyle(Ink.paper)
@@ -397,6 +424,10 @@ struct HomeView: View {
     /// The last run in a few words: "3 new", "Up to date", "Stopped".
     private var resultTitle: String {
         if summaryTone == .bad { return model.purpose == .browse ? "Could not read the card" : "Stopped" }
+        if case .delete = model.purpose {
+            let gone = model.files.filter { $0.state == "deleted" }.count
+            return "Deleted \(gone) from the camera"
+        }
         let copied = model.files.filter { $0.state == "full" }.count
         if model.purpose == .browse { return "\(model.cameraPhotos.count) on the camera" }
         return copied == 0 ? "Up to date" : "\(copied) new photo\(copied == 1 ? "" : "s")"
@@ -420,10 +451,8 @@ struct HomeView: View {
     }
 
     private var scopeShort: String {
-        switch model.scope {
-        case .all: return "All"
-        default: return "\(model.scope.rawValue)"
-        }
+        let count = model.scope == .all ? "All" : "\(model.scope.rawValue)"
+        return model.importSize == .original ? count : "\(count) · \(model.importSize.short)"
     }
 
     // MARK: Running
@@ -452,6 +481,7 @@ struct HomeView: View {
         switch model.purpose {
         case .browse where runStep == runSteps.count - 1: return "Reading the card"
         case .open: return "Fetching full size"
+        case .delete: return "Deleting from the camera"
         default: return runSteps[min(runStep, runSteps.count - 1)].title
         }
     }
@@ -472,7 +502,7 @@ struct HomeView: View {
         let card = (symbol: "sdcard", title: "Opening the card", key: "card")
         let copy = model.purpose == .browse
             ? (symbol: "square.grid.2x2", title: "Listing photos", key: "copy")
-            : (symbol: "photo.on.rectangle", title: "Copying", key: "copy")
+            : (symbol: "photo.on.rectangle", title: "Importing", key: "copy")
         if model.runTransport == .usb {
             return [(symbol: "cable.connector", title: "Opening the camera", key: "open"), card, copy]
         }
@@ -502,7 +532,7 @@ struct HomeView: View {
     private var summaryTone: NoticeTone {
         switch model.phase {
         case "Stopped": return .bad
-        case "Copied": return .good
+        case "Copied", "Deleted": return .good
         default: return .info
         }
     }
@@ -566,16 +596,91 @@ struct HomeView: View {
     }
 
     private var galleryHeader: some View {
-        HStack(alignment: .center, spacing: 12) {
-            Picker("Show", selection: $tab) {
-                Text("Imported · \(model.saved.count)").tag(GalleryTab.imported)
-                Text(model.cameraPhotos.isEmpty ? "On the camera" : "On the camera · \(model.cameraPhotos.count)").tag(GalleryTab.camera)
-            }
-            .pickerStyle(.segmented)
-            .frame(maxWidth: 340)
-            Spacer(minLength: 0)
+        // The two tabs and the action share one look: an icon and a word, like the Files button.
+        HStack(alignment: .center, spacing: 4) {
+            tabButton(.imported, "Imported", symbol: "photo.on.rectangle", count: model.saved.count)
+            tabButton(.camera, "Camera", symbol: "camera", count: model.cameraPhotos.isEmpty ? nil : model.cameraPhotos.count)
+            Spacer(minLength: 8)
             galleryAction
         }
+    }
+
+    /// Above the card's grid: how much of the card is listed, and a way to list more of it, a page at a time
+    /// or all of it, the grid filling as the thumbnails arrive.
+    @ViewBuilder
+    private var cardBar: some View {
+        let listing = model.busy && model.purpose == .browse && model.mode == .camera
+        let shown = model.cameraPhotos.count
+        HStack(spacing: 14) {
+            Group {
+                if let total = model.cardTotal {
+                    Text(listing ? "Loading · \(shown) of \(total)" : (shown >= total ? "Whole card · \(total)" : "\(shown) of \(total) on the card"))
+                } else {
+                    Text(listing ? "Loading · \(shown)" : "\(shown) on the card")
+                }
+            }
+            .font(Ink.side(.detail))
+            .monospacedDigit()
+            .foregroundStyle(Ink.ink2)
+            if listing {
+                ProgressView().controlSize(.small)
+            }
+            Spacer(minLength: 8)
+            if listing {
+                LinkButton(title: "Stop", systemImage: "stop.circle") { model.stop() }
+            } else if (model.cardRemaining ?? 1) > 0 {
+                Menu {
+                    ForEach([25, 100, 500], id: \.self) { page in
+                        Button("\(page) more") {
+                            model.browsePage = page
+                            model.browseMore(page)
+                        }
+                    }
+                } label: {
+                    Label("\(min(model.browsePage, model.cardRemaining ?? model.browsePage)) more", systemImage: "arrow.down.circle")
+                        .font(Ink.side(.title))
+                        .foregroundStyle(Ink.ink)
+                } primaryAction: {
+                    model.browseMore(model.browsePage)
+                }
+                .menuStyle(.button)
+                .buttonStyle(.plain)
+                .fixedSize()
+                .disabled(model.busy)
+                .help("List older photos from the card")
+                LinkButton(title: "Load all", systemImage: "arrow.down.to.line") { model.browseMore(nil) }
+                    .disabled(model.busy)
+                    .help("Keep listing until the whole card is here")
+            }
+        }
+        .padding(.horizontal, 4)
+    }
+
+    private func tabButton(_ value: GalleryTab, _ title: String, symbol: String, count: Int?) -> some View {
+        let on = tab == value
+        return Button {
+            withAnimation(.snappy(duration: 0.2)) { tab = value }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: symbol)
+                Text(title)
+                // Only the open tab counts: on a 375-point phone three labels and two numbers do not fit.
+                if on, let count {
+                    Text("\(count)")
+                        .monospacedDigit()
+                        .foregroundStyle(Ink.ink2)
+                }
+            }
+            .font(Ink.side(.title))
+            .foregroundStyle(on ? Ink.ink : Ink.ink2)
+            .lineLimit(1)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(on ? Ink.surface2 : .clear, in: Capsule())
+            .contentShape(Capsule())
+        }
+        .buttonStyle(InkPress())
+        .accessibilityAddTraits(on ? .isSelected : [])
     }
 
     @ViewBuilder
@@ -608,6 +713,8 @@ struct HomeView: View {
                           action: ("Browse the camera", "square.grid.2x2", { model.browse() }))
                 }
             } else {
+                cardBar
+                    .padding(.bottom, 10)
                 JustifiedGrid(items: model.cameraPhotos, ratio: CameraThumb.ratio, rowHeight: rowHeight) { photo, _ in
                     CameraTile(photo: photo, selected: model.selection.contains(photo.handle), imported: model.importedNames.contains(photo.name))
                         .selectable(open: { openViewer(.camera(photo)) }) { kind in clickCamera(photo, kind) }
@@ -625,7 +732,7 @@ struct HomeView: View {
         case .camera:
             if !model.cameraPhotos.isEmpty && model.selection.isEmpty {
                 let fresh = freshHandles
-                LinkButton(title: "Select new · \(fresh.count)") { model.selection = Set(fresh) }
+                LinkButton(title: "\(fresh.count) new", systemImage: "checkmark.circle") { model.selection = Set(fresh) }
                     .disabled(model.busy || fresh.isEmpty)
             }
         }
@@ -743,13 +850,46 @@ struct HomeView: View {
     @ViewBuilder
     private func cameraMenu(_ photo: CardPhoto) -> some View {
         let on = model.selection.contains(photo.handle)
+        let many = on && model.selection.count > 1
         Button("View", systemImage: "arrow.up.left.and.arrow.down.right") { openViewer(.camera(photo)) }
         Button(on ? "Deselect" : "Select", systemImage: on ? "circle" : "checkmark.circle") { clickCamera(photo, .command) }
-        Button(on && model.selection.count > 1 ? "Import \(model.selection.count) Photos" : "Import", systemImage: "arrow.down.to.line") {
+        Button(many ? "Import \(model.selection.count) Photos" : "Import", systemImage: "arrow.down.to.line") {
             if !on { model.selection = [photo.handle] }
             model.importFromCamera()
         }
         .disabled(model.busy)
+        Divider()
+        Button(many ? "Delete \(model.selection.count) from Camera…" : "Delete from Camera…", systemImage: "trash", role: .destructive) {
+            cameraDeleteTarget = many ? model.selection : [photo.handle]
+        }
+        .disabled(model.busy)
+    }
+
+    private func askToDeleteSelection() {
+        guard model.viewer == nil || tab == .camera else { return }
+        if tab == .imported && !picked.isEmpty { confirmDelete = true }
+        if tab == .camera && !model.busy {
+            if let viewer = model.viewer, viewer.tab == .camera, let handle = Int(viewer.id.replacingOccurrences(of: "camera-", with: "")) {
+                cameraDeleteTarget = [handle]
+            } else if !model.selection.isEmpty {
+                cameraDeleteTarget = model.selection
+            }
+        }
+    }
+
+    private var cameraDeleteTitle: String {
+        let count = cameraDeleteTarget?.count ?? 0
+        return count == 1 ? "Delete this photo from the camera?" : "Delete \(count) photos from the camera?"
+    }
+
+    /// Says what is at stake: the card copy goes for good, and whether a copy exists here.
+    private var cameraDeleteMessage: String {
+        let target = cameraDeleteTarget ?? []
+        let photos = model.cameraPhotos.filter { target.contains($0.handle) }
+        let missing = photos.filter { !model.importedNames.contains($0.name) }.count
+        let base = "This removes \(target.count == 1 ? "it" : "them") from the memory card. It cannot be undone."
+        if missing == 0 { return base + " \(target.count == 1 ? "It is" : "All of them are") already in your library." }
+        return base + " \(missing == target.count ? (missing == 1 ? "It has" : "They have") : "\(missing) of them have") not been imported yet."
     }
 
     /// Floats over the grid while something is picked: what can be done with it, and a way out.
@@ -776,6 +916,13 @@ struct HomeView: View {
                     .foregroundStyle(Ink.bad)
                     .help("Delete")
                 } else {
+                    Button { cameraDeleteTarget = model.selection } label: {
+                        Label("Delete from Camera", systemImage: "trash").labelStyle(.iconOnly)
+                    }
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(Ink.bad)
+                    .disabled(model.busy)
+                    .help("Delete from the camera")
                     Button { model.importFromCamera() } label: {
                         Label("Import", systemImage: "arrow.down.to.line")
                             .font(Ink.prose(14, .semibold))
@@ -834,7 +981,8 @@ struct HomeView: View {
                     selected: isSelected(items[index]),
                     move: moveViewer,
                     toggle: { toggleSelected(items[index]) },
-                    close: closeViewer
+                    close: closeViewer,
+                    deleteFromCamera: { handle in cameraDeleteTarget = [handle] }
                 )
                 .transition(.opacity)
             }
@@ -924,8 +1072,13 @@ struct HomeView: View {
                 if case .camera(let photo) = shownItem { model.fetchFullSize(photo) }
             }
             .keyboardShortcut("f", modifiers: [])
-            Button("Delete") { if tab == .imported && !picked.isEmpty { confirmDelete = true } }
+            // ⌘⌫ like Finder, and the bare Delete / Suppr keys (⌫ and ⌦): each one asks before anything goes.
+            Button("Delete") { askToDeleteSelection() }
                 .keyboardShortcut(.delete, modifiers: .command)
+            Button("Delete (key)") { askToDeleteSelection() }
+                .keyboardShortcut(.delete, modifiers: [])
+            Button("Delete Forward") { askToDeleteSelection() }
+                .keyboardShortcut(.deleteForward, modifiers: [])
             Button("Quick Look") { toggleViewer() }
             .keyboardShortcut(.space, modifiers: [])
             Button("Zoom In") { zoom = min((zoom == 0 ? rowHeight(wide: true) : zoom) * 1.25, 420) }.keyboardShortcut("+", modifiers: .command)
@@ -1550,6 +1703,7 @@ struct DiagnosticsView: View {
         let what: String
         switch use {
         case "browse": what = "Browse"
+        case "delete": what = "Delete from camera"
         case "open": what = "Full-size look"
         case "bridge", "latch", "xapp": what = "Test bench · \(use == "xapp" ? "XApp replay" : "Fuji Bridge")"
         default: what = "Import"

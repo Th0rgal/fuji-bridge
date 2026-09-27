@@ -12,10 +12,16 @@ enum Fuji {
     static let openSession: UInt16 = 0x1002
     static let getObjectHandles: UInt16 = 0x1007
     static let getThumb: UInt16 = 0x100a
+    /// Standard PTP DeleteObject(handle, format 0). Fuji bodies implement 0x1001 to 0x100B (libfuji docs/dev.md),
+    /// and XApp's native layer carries an ExecDeleteImage built on it.
+    static let deleteObject: UInt16 = 0x100b
     static let getObjectInfo: UInt16 = 0x1008
     static let getProp: UInt16 = 0x1015
     static let setProp: UInt16 = 0x1016
     static let getPartial: UInt16 = 0x101b
+    /// MTP GetObjectPropValue. XApp reads a file's size as ObjectSize (0xDC04) with it, instead of turning on D227.
+    static let getObjectPropValue: UInt16 = 0x9803
+    static let objectSize: UInt32 = 0xdc04
     static let ok: UInt16 = 0x2001
     static let invalidObject: UInt16 = 0x2009
     static let sessionAlreadyOpen: UInt16 = 0x201e
@@ -38,9 +44,13 @@ enum Fuji {
     static let remoteVersion: UInt32 = 0xdf24
     static let remoteObjectVersion: UInt32 = 0xdf25
     static let remotePhotoView: UInt32 = 0xdf28
+    /// XApp's ImageForceCompression: 2 for original files, 1 when it resizes, 0 outside an import.
     static let compressSmall: UInt32 = 0xd226
+    /// XApp's ImageCompressionRealInfo. XApp leaves it at 0; libfuji sets 1 so ObjectInfo reports the real size.
     static let correctSize: UInt32 = 0xd227
     static let unknownD22B: UInt32 = 0xd22b
+    /// XApp's ObjectCompressionSetting: the size a resized import comes out at (1 S, 0 XS).
+    static let resizeRate: UInt32 = 0xd22e
     static let importCount: UInt32 = 0xd620
     static let importHandles: UInt32 = 0xd621
 }
@@ -202,10 +212,13 @@ protocol ByteLink: AnyObject, Sendable {
     func close() async
     /// Socket-level events (state changes, path, timeouts) for the trace.
     func observe(_ sink: @escaping @Sendable (String, String) -> Void)
+    /// How long a read may wait for the next byte before the link gives up.
+    func setReadTimeout(_ seconds: TimeInterval)
 }
 
 extension ByteLink {
     func observe(_ sink: @escaping @Sendable (String, String) -> Void) {}
+    func setReadTimeout(_ seconds: TimeInterval) {}
 }
 
 /// Packed `PtpFujiEvents`: u16 count, then {u16 code, u32 value}. DF00 is not always first.

@@ -50,7 +50,7 @@ struct ImportRun: Identifiable, Decodable {
         // Older reports are named -usb, -wifi or -camera without the purpose; their result tells a browse apart.
         let names = Diagnostics.history().filter { url in
             let name = url.lastPathComponent
-            return url.pathExtension == "json" && !name.contains("virtual") && !name.contains("-browse") && !name.contains("-open")
+            return url.pathExtension == "json" && !name.contains("virtual") && !name.contains("-browse") && !name.contains("-open") && !name.contains("-delete")
         }
         var runs: [ImportRun] = []
         for url in names.prefix(60) where runs.count < limit {

@@ -81,6 +81,38 @@ enum Transport: String, Sendable, Codable {
     case usb
 }
 
+/// What size the body sends over Wi-Fi. The body resizes the JPEG itself, as XApp's "Resize" setting does.
+/// Over USB files always come as they are on the card.
+enum ImportSize: String, CaseIterable, Identifiable, Sendable {
+    case original
+    case small
+    case extraSmall
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .original: return "Original"
+        case .small: return "Resized S"
+        case .extraSmall: return "Resized XS"
+        }
+    }
+    var short: String {
+        switch self {
+        case .original: return ""
+        case .small: return "S"
+        case .extraSmall: return "XS"
+        }
+    }
+    /// D22E, or nil for the file as shot.
+    var rate: UInt16? {
+        switch self {
+        case .original: return nil
+        case .small: return 1
+        case .extraSmall: return 0
+        }
+    }
+}
+
 struct RunOptions: Sendable {
     var kind: ClientKind
     var frames: [CardFrame]
@@ -97,6 +129,11 @@ struct RunOptions: Sendable {
     var transport: Transport = .wifi
     /// Live runs only: copy at most the newest N frames of the card's list. Nil is the whole card.
     var latest: Int? = nil
+    /// Live runs only: leave out the newest N first (they are already on screen), then apply `latest`.
+    /// Browsing further back into the card is `skipNewest: shown, latest: page`.
+    var skipNewest: Int = 0
+    /// Live runs only: how many frames the card lists, reported once, before any scope is applied.
+    var cardCount: (@Sendable (Int) -> Void)? = nil
     /// Live runs only: just these handles, whatever the scope.
     var only: Set<Int>? = nil
     /// Set to list the card instead of copying it: each frame's ObjectInfo and thumbnail come back here.
@@ -105,6 +142,12 @@ struct RunOptions: Sendable {
     /// The session's clock origin, so the importer's lines and the app's events share one timeline in the
     /// report. Without it the socket's lines restart at 0 when the import starts, after the Bluetooth wake.
     var clockOrigin: UInt64? = nil
+    /// Live runs only: delete the frames in `only` from the card instead of copying them.
+    var delete: Bool = false
+    /// Read deadline once files are moving. XApp gives a GetObject 30 s; nil keeps the link's own.
+    var transferTimeout: TimeInterval? = nil
+    /// Copies only, over Wi-Fi: have the body resize each JPEG before sending it.
+    var size: ImportSize = .original
 }
 
 enum Importer {
@@ -164,11 +207,18 @@ enum Importer {
                     files: files
                 )
             }
+            options.cardCount?(handles.count)
             if let only = options.only {
                 handles = handles.filter { only.contains($0) }
-            } else if let latest = options.latest, latest > 0, handles.count > latest {
-                io.note("Newest \(latest)", "The card lists \(handles.count). Only the last \(latest) are considered.")
-                handles = Array(handles.suffix(latest))
+            } else {
+                if options.skipNewest > 0 {
+                    io.note("Skip newest \(options.skipNewest)", "Already listed. Continuing \(max(handles.count - options.skipNewest, 0)) frames further back.")
+                    handles = Array(handles.dropLast(options.skipNewest))
+                }
+                if let latest = options.latest, latest > 0, handles.count > latest {
+                    io.note("Newest \(latest)", "The card lists \(handles.count). Only the last \(latest) are considered.")
+                    handles = Array(handles.suffix(latest))
+                }
             }
             queue = handles.map { handle in
                 if let known = options.frames.first(where: { $0.handle == handle }) {
@@ -180,7 +230,50 @@ enum Importer {
                 FileResult(handle: $0.handle, name: $0.name, got: 0, total: $0.bytes, state: "lost")
             }
         }
+        if options.delete {
+            return await delete(queue: queue, files: files, io: io, link: link, options: options)
+        }
         return await copy(queue: queue, files: files, io: io, link: link, options: options)
+    }
+
+    /// One DeleteObject per frame. A frame the body refuses (protected, card locked) is reported and skipped;
+    /// a dead link ends the run, and what was deleted before stays deleted.
+    private static func delete(queue: [CardFrame], files: [FileResult], io: IO, link: ByteLink, options: RunOptions) async -> RunResult {
+        var files = files
+        var refusals: [String] = []
+        for (index, frame) in queue.enumerated() {
+            if options.control.aborted || Task.isCancelled { break }
+            do {
+                _ = try await io.command(Fuji.deleteObject, tid: io.tid, params: [UInt32(frame.handle), 0],
+                                         title: "DeleteObject \(frame.name)", op: "delete")
+                io.tid += 1
+                files[index].state = "deleted"
+            } catch LinkError.response(let rc) {
+                io.tid += 1
+                files[index].state = "refused"
+                refusals.append("\(frame.name): \(Self.deleteRefusal(rc))")
+            } catch {
+                await link.close()
+                let done = files.filter { $0.state == "deleted" }.count
+                return RunResult(ok: false, reason: "link", summary: "Deleted \(done) of \(queue.count), then the link failed. \(IO.describe(error))", files: files)
+            }
+        }
+        await link.close()
+        let done = files.filter { $0.state == "deleted" }.count
+        if refusals.isEmpty {
+            return RunResult(ok: true, reason: "deleted", summary: "Deleted \(done) from the camera.", files: files)
+        }
+        return RunResult(ok: done > 0, reason: "delete-refused", summary: "Deleted \(done) of \(queue.count). The camera refused " + refusals.joined(separator: "; ") + ".", files: files)
+    }
+
+    static func deleteRefusal(_ rc: UInt16) -> String {
+        switch rc {
+        case 0x200f: return "the photo is protected"
+        case 0x200d, 0x200e: return "the card is locked or read-only"
+        case 0x2005: return "this connection mode does not allow deleting"
+        case 0x2009: return "the photo is no longer on the card"
+        default: return String(format: "response 0x%04X", rc)
+        }
     }
 
     /// Fuji Wi-Fi: init (retried on Init Fail), settle, OpenSession, OK on the camera, gallery props, D621.
@@ -342,17 +435,30 @@ enum Importer {
         let name = kind == .bridge ? "Fuji Bridge" : "XApp"
         var copiedBytes = 0
         var transferMs = 0.0
+        // XApp sets D226 once when an import starts and back to 0 when it ends. Flipping it around every
+        // file, as libfuji does, costs four commands per file and makes the body switch modes each time.
+        let fujiProps = kind == .bridge && !usb
+        if fujiProps {
+            // XApp: D22E picks the resized size, then D226 = 1 turns resizing on (2 sends the original).
+            // A resized file's length is only in ObjectInfo once D227 is on.
+            if options.preview == nil, let rate = options.size.rate {
+                _ = try? await io.setProp(Fuji.resizeRate, value: LE.data16(rate), title: "Set D22E = \(rate)", op: "prep")
+                io.resizeRate = rate
+                io.realSizeInfo = true
+                _ = try? await io.setProp(Fuji.correctSize, value: LE.data16(1), title: "Set D227 = 1", op: "prep")
+            }
+            _ = try? await io.setProp(Fuji.compressSmall, value: LE.data16(io.forceCompression), title: "Set D226 = \(io.forceCompression)", op: "prep")
+            // A deadline shorter than the body needs cuts a slow window, reconnects and asks again,
+            // which is slower still.
+            if let seconds = options.transferTimeout { link.setReadTimeout(seconds) }
+        }
         for index in queue.indices {
             if options.control.aborted || Task.isCancelled { return await stop(files, io) }
             let frame = queue[index]
             let fileStart = io.now()
             io.file = options.live ? "#\(frame.handle)" : frame.name
             options.progress?(LiveProgress(index: index, count: queue.count, name: frame.name, got: 0, total: frame.bytes, bytesPerSecond: 0, copiedBytes: copiedBytes))
-            if kind == .bridge && !usb {
-                _ = try? await io.setProp(Fuji.compressSmall, value: LE.data16(2), title: "Set D226 = 2", op: "prep")
-                _ = try? await io.setProp(Fuji.correctSize, value: LE.data16(1), title: "Set D227 = 1", op: "prep")
-            }
-            let info: Data
+            var info: Data
             do {
                 info = try await io.getData(Fuji.getObjectInfo, params: [UInt32(frame.handle)], title: options.live ? "GetObjectInfo #\(frame.handle)" : "GetObjectInfo \(frame.name)", op: "prep")
             } catch LinkError.response(let rc) {
@@ -381,7 +487,20 @@ enum Importer {
                 files[index].state = "skipped"
                 continue
             }
-            let reported = (usb ? ObjectInfo.standardSize(info) : ObjectInfo.compressedSize(info)) ?? 0
+            var reported = (usb ? ObjectInfo.standardSize(info) : ObjectInfo.compressedSize(info)) ?? 0
+            if fujiProps, !io.realSizeInfo {
+                if let size = await io.objectSize(frame.handle), size > 0 {
+                    reported = size
+                } else {
+                    // No ObjectSize on this body: fall back to libfuji's D227 = 1, which makes ObjectInfo honest.
+                    io.realSizeInfo = true
+                    _ = try? await io.setProp(Fuji.correctSize, value: LE.data16(1), title: "Set D227 = 1", op: "prep")
+                    if let again = try? await io.getData(Fuji.getObjectInfo, params: [UInt32(frame.handle)], title: "GetObjectInfo \(files[index].name)", op: "prep") {
+                        info = again
+                        reported = ObjectInfo.compressedSize(info) ?? 0
+                    }
+                }
+            }
             let maxPartial = !usb && info.count >= 12 ? Int(LE.u32(info, 8)) : Fuji.partialMax
             io.note(
                 "ObjectInfo \(files[index].name)",
@@ -420,7 +539,8 @@ enum Importer {
             if kind == .bridge, options.skipExisting, let dir = options.saveDirectory {
                 let url = dir.appendingPathComponent(files[index].name)
                 let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue
-                if size == reported {
+                // A resized copy never matches the original's size: any file by that name is enough.
+                if size == reported || (io.resizeRate != nil && (size ?? 0) > 0) {
                     files[index].got = reported
                     files[index].total = reported
                     files[index].state = "already"
@@ -524,11 +644,8 @@ enum Importer {
             let pullMs = io.now() - pullStart
             transferMs += pullMs
             copiedBytes += offset
-            if !usb {
-                _ = try? await io.setProp(Fuji.compressSmall, value: LE.data16(0), title: "Set D226 = 0", op: "prep")
-                _ = try? await io.setProp(Fuji.correctSize, value: LE.data16(0), title: "Set D227 = 0", op: "prep")
-            }
-            let goal = frame.bytes > 0 ? frame.bytes : total
+            // A resized file is as long as the body says, not as long as the one on the card.
+            let goal = io.resizeRate == nil && frame.bytes > 0 ? frame.bytes : total
             files[index].got = offset
             files[index].total = goal
             files[index].state = goal > 0 && offset >= goal ? "full" : "partial"
@@ -552,6 +669,12 @@ enum Importer {
         }
         io.file = ""
 
+        if fujiProps {
+            _ = try? await io.setProp(Fuji.compressSmall, value: LE.data16(0), title: "Set D226 = 0", op: "prep")
+            if io.realSizeInfo {
+                _ = try? await io.setProp(Fuji.correctSize, value: LE.data16(0), title: "Set D227 = 0", op: "prep")
+            }
+        }
         await link.close()
         if options.preview != nil {
             let listed = files.filter { $0.state == "previewed" }.count
@@ -659,6 +782,11 @@ private final class IO: @unchecked Sendable {
     let log: (TraceLine) -> Void
     var tid: UInt32 = 1
     var objectCount = 0
+    /// D227 is on: the body did not answer ObjectSize, or it is resizing.
+    var realSizeInfo = false
+    /// D22E while the body resizes, nil for originals.
+    var resizeRate: UInt16?
+    var forceCompression: UInt16 { resizeRate == nil ? 2 : 1 }
     var importHandles: [Int] = []
     var transport: Transport = .wifi
     /// Frame the next lines belong to.
@@ -749,8 +877,13 @@ private final class IO: @unchecked Sendable {
         _ = try await command(Fuji.openSession, tid: 1, params: [1], title: "OpenSession", op: "reconnect")
         tid = 2
         try await setProp(Fuji.clientState, value: LE.data16(20), title: "Set DF01 = 20", op: "reconnect")
-        try await setProp(Fuji.compressSmall, value: LE.data16(2), title: "Set D226 = 2", op: "reconnect")
-        try await setProp(Fuji.correctSize, value: LE.data16(1), title: "Set D227 = 1", op: "reconnect")
+        if let rate = resizeRate {
+            try await setProp(Fuji.resizeRate, value: LE.data16(rate), title: "Set D22E = \(rate)", op: "reconnect")
+        }
+        try await setProp(Fuji.compressSmall, value: LE.data16(forceCompression), title: "Set D226 = \(forceCompression)", op: "reconnect")
+        if realSizeInfo {
+            try await setProp(Fuji.correctSize, value: LE.data16(1), title: "Set D227 = 1", op: "reconnect")
+        }
     }
 
     @discardableResult
@@ -802,6 +935,14 @@ private final class IO: @unchecked Sendable {
     func getData(_ code: UInt16, params: [UInt32], title: String, op: String = "cmd") async throws -> Data {
         defer { tid += 1 }
         return try await command(code, tid: tid, params: params, title: title, op: op)
+    }
+
+    /// ObjectSize (0xDC04) through GetObjectPropValue, the way XApp learns how long a file is.
+    func objectSize(_ handle: Int) async -> Int? {
+        guard let data = try? await getData(Fuji.getObjectPropValue, params: [UInt32(handle), Fuji.objectSize], title: "ObjectSize #\(handle)", op: "info") else { return nil }
+        if data.count >= 8 { return Int(LE.u32(data, 0)) | (Int(LE.u32(data, 4)) << 32) }
+        if data.count >= 4 { return Int(LE.u32(data, 0)) }
+        return nil
     }
 
     func cameraState() async throws -> UInt32 {
