@@ -84,6 +84,21 @@ struct FujiAdvert: Equatable, Sendable {
 }
 
 /// The body's access point, as read over Bluetooth.
+/// Bluetooth on this device, in the terms the camera card needs.
+enum BluetoothPower: Equatable {
+    case unknown, on, off, denied, unsupported
+
+    init(_ state: CBManagerState) {
+        switch state {
+        case .poweredOn: self = .on
+        case .poweredOff: self = .off
+        case .unauthorized: self = .denied
+        case .unsupported: self = .unsupported
+        default: self = .unknown
+        }
+    }
+}
+
 struct CameraWifi: Equatable, Sendable {
     var ssid: String
     var password: String
@@ -102,7 +117,7 @@ enum BLEError: Error, CustomStringConvertible {
 
     var description: String {
         switch self {
-        case .off: return "Bluetooth is off"
+        case .off: return "Bluetooth is off on this device"
         case .unauthorized: return "Fuji Bridge is not allowed to use Bluetooth (Settings › Privacy › Bluetooth)"
         case .notFound: return "No Fujifilm camera advertising nearby. Is the camera on?"
         case .missing(let uuid): return "The camera has no characteristic \(uuid.uuidString)"
@@ -217,6 +232,8 @@ final class FujiBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
     /// Called on the main thread when a Fujifilm body shows up, or its name or advertisement changes.
     /// The flag says whether this device has woken that body before (so it is bonded here).
     var onCamera: ((String, FujiAdvert, Bool) -> Void)?
+    /// Called on the main thread when Bluetooth is switched on or off, or its permission changes.
+    var onPower: ((CBManagerState) -> Void)?
     private var names: [UUID: String] = [:]
     /// When each body was last heard. Switching to pairing mode gives the body a new address, and the old
     /// identifier never answers again, so only recently heard ones are worth connecting to.
@@ -573,6 +590,8 @@ final class FujiBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         emit("Bluetooth state", "\(central.state.rawValue)")
+        let state = central.state
+        DispatchQueue.main.async { self.onPower?(state) }
         if central.state != .unknown && central.state != .resetting {
             let waiters = stateWaiters
             stateWaiters.removeAll()

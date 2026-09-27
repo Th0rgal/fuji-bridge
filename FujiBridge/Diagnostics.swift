@@ -20,7 +20,7 @@ final class SessionLog: @unchecked Sendable {
     private var handle: FileHandle?
     private var store: [TraceLine] = []
     private var extraSeq = 1_000_000
-    private let origin = DispatchTime.now().uptimeNanoseconds
+    let origin = DispatchTime.now().uptimeNanoseconds
 
     init(label: String) {
         started = Date()

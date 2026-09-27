@@ -28,6 +28,10 @@
 	<string>Fuji Bridge finds your Fujifilm over Bluetooth and asks it to turn on its Wi-Fi for the import.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Fuji Bridge copies photos from a Fujifilm camera connected by USB.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_fujibridge._tcp</string>
+	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Fuji Bridge connects to the X100VI on its Wi-Fi network to copy photos.</string>
 	<key>UIFileSharingEnabled</key>

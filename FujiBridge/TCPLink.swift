@@ -18,6 +18,8 @@ final class TCPLink: ByteLink, @unchecked Sendable {
     private var opened = 0.0
 
     private(set) var bytesIn = 0
+    /// The path was held back by Local Network privacy at some point and never became ready.
+    private(set) var localNetworkDenied = false
     private(set) var bytesOut = 0
     private(set) var receives = 0
 
@@ -80,8 +82,15 @@ final class TCPLink: ByteLink, @unchecked Sendable {
                     self.emit("TCP preparing", after)
                 case .waiting(let error):
                     // No route, refused, or the phone is not on the camera Wi-Fi. NWConnection retries by itself.
-                    self.emit("TCP waiting", "\(error.debugDescription). \(after). Is this device on FUJIFILM-xxxx?")
+                    if connection.currentPath?.unsatisfiedReason == .localNetworkDenied {
+                        // Also the state while the Local Network prompt is still on screen: note it, keep waiting.
+                        self.localNetworkDenied = true
+                        self.emit("TCP waiting", "Local Network access denied (or not answered yet). \(after).")
+                    } else {
+                        self.emit("TCP waiting", "\(error.debugDescription). \(after). Is this device on FUJIFILM-xxxx?")
+                    }
                 case .ready:
+                    self.localNetworkDenied = false
                     var local = ""
                     if let endpoint = connection.currentPath?.localEndpoint { local = " from \(endpoint)" }
                     self.emit("TCP ready", "\(after)\(local).")

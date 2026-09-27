@@ -24,6 +24,15 @@ struct Viewer: Equatable {
 }
 
 /// What a camera run is for. All four go through the same importer.
+/// A stop the user can do something about, shown instead of the generic reason.
+struct StopHint: Equatable {
+    var symbol: String
+    var title: String
+    var detail: String
+    /// Opens the app's page in Settings (permissions).
+    var opensSettings = false
+}
+
 enum Purpose: Equatable {
     /// The newest frames in scope that are not here yet.
     case newPhotos
@@ -80,6 +89,13 @@ final class BenchModel {
     private var pairingRequested = false
     /// Why the Bluetooth step failed, so the summary does not only blame the Wi-Fi.
     private var bleFailure: String?
+    private var bleError: Error?
+    private var lastLocalNetworkDenied = false
+    /// Bluetooth on this device, as CoreBluetooth last reported it. Only known once Bluetooth is enabled in the app.
+    var bluetoothPower: BluetoothPower = .unknown
+    /// Why the last run stopped, in words a person can act on, when the cause is known (Bluetooth off,
+    /// the join declined, Local Network denied…). Replaces the generic "camera not reachable".
+    var stopHint: StopHint?
     /// Names already in the photos folder, to mark frames on the camera that are here.
     var importedNames: Set<String> { Set(saved.map(\.lastPathComponent)) }
     var scope: Scope = Scope(rawValue: UserDefaults.standard.object(forKey: "BridgeScope") as? Int ?? 25) ?? .latest25 {
@@ -115,7 +131,18 @@ final class BenchModel {
                 if advert.kind == .securePairing || advert.kind == .basicPairing || known { self.bluetoothNeedsPairing = false }
             }
         }
-        if bluetoothEnabled { FujiBluetooth.shared.startScan() }
+        FujiBluetooth.shared.onPower = { [weak self] state in
+            Task { @MainActor in
+                guard let self else { return }
+                self.bluetoothPower = BluetoothPower(state)
+                // A body heard before Bluetooth went off is not reachable any more: do not keep showing it.
+                if self.bluetoothPower != .on { self.bluetoothCamera = nil }
+            }
+        }
+        if bluetoothEnabled {
+            FujiBluetooth.shared.startScan()
+            LocalNetwork.ask()
+        }
         #if DEBUG
         // Scripted rehearsals:  -BridgeAutoRun camera|usb|wifi|virtual  (-BridgeScope 5 limits the card).
         if let auto = UserDefaults.standard.string(forKey: "BridgeAutoRun") {
@@ -184,6 +211,9 @@ final class BenchModel {
         bluetoothEnabled = true
         UserDefaults.standard.set(true, forKey: "BridgeBluetooth")
         FujiBluetooth.shared.startScan()
+        // The Wi-Fi import will need Local Network access: ask now, while the user is setting things up,
+        // rather than in the middle of the first join, where a pending prompt looks like a failed connection.
+        LocalNetwork.ask()
     }
 
     func toggle(_ photo: CardPhoto) {
@@ -287,12 +317,15 @@ final class BenchModel {
                 // Wi-Fi with a Fujifilm heard over Bluetooth: have it start its access point and join it first.
                 var connectTimeout: TimeInterval = 8
                 self.bleFailure = nil
+                self.bleError = nil
+                self.stopHint = nil
                 // Bluetooth on: look for the body even if it has not been heard yet (it may have just woken up).
                 if transport == .wifi && self.bluetoothEnabled {
                     connectTimeout = await self.wakeAndJoin(session)
                 }
                 // After a Bluetooth wake the body can take its time to answer the first packet.
-                let tcp = transport == .wifi ? TCPLink(host: host, connectTimeout: connectTimeout, readTimeout: connectTimeout > 8 ? 30 : 10) : nil
+                // Three init attempts of 12 s each beat one of 30 s: a silent socket gets replaced (Session.swift).
+                let tcp = transport == .wifi ? TCPLink(host: host, connectTimeout: connectTimeout, readTimeout: connectTimeout > 8 ? 12 : 10) : nil
                 let link: ByteLink = tcp ?? USBLink()
                 let opening: Bool
                 if case .open = purpose { opening = true } else { opening = false }
@@ -314,7 +347,8 @@ final class BenchModel {
                         latest: latest,
                         only: only,
                         preview: preview,
-                        progress: progress
+                        progress: progress,
+                        clockOrigin: session.origin
                     ),
                     log: log
                 )
@@ -324,6 +358,7 @@ final class BenchModel {
                     session.event("ImageCaptureCore totals", String(format: "%d commands, %.0f ms inside ImageCaptureCore, %.0f ms in the hop back.", usb.commands, usb.iccMs, usb.hopMs), op: "net")
                     usb.resetCounters()
                 }
+                lastLocalNetworkDenied = tcp?.localNetworkDenied ?? false
                 if let tcp {
                     session.event("Socket totals", "\(ByteFormat.string(tcp.bytesIn)) in over \(tcp.receives) receives, \(ByteFormat.string(tcp.bytesOut)) out.", op: "net")
                 }
@@ -345,6 +380,9 @@ final class BenchModel {
             }
             summary = result.summary
             if !result.ok, let bleFailure { summary = "Bluetooth: \(bleFailure) Then Wi-Fi: \(result.summary)" }
+            if !result.ok && mode != .virtual && transport == .wifi {
+                stopHint = Self.hint(ble: bleError, localNetworkDenied: lastLocalNetworkDenied)
+            }
             joinByHand = false
             pairingRequested = false
             if result.reason != "still-waiting" {
@@ -412,7 +450,7 @@ final class BenchModel {
             cameraWifi = wifi
             session.event("Wi-Fi woken", "\(wifi.ssid) in \(Int(Date().timeIntervalSince(start) * 1000)) ms over Bluetooth.", op: "ble")
             phase = "Joining \(wifi.ssid)"
-            let outcome = try await WifiJoin.join(wifi)
+            let outcome = try await WifiJoin.join(wifi, host: host) { title, detail in session.event(title, detail, op: "ble") }
             joinByHand = outcome == .manual
             session.event(outcome == .joined ? "Wi-Fi joined" : "Join by hand", outcome == .joined
                 ? "iOS joined \(wifi.ssid)."
@@ -420,11 +458,42 @@ final class BenchModel {
             if outcome == .manual { phase = "Join \(wifi.ssid) in the Wi-Fi menu" }
             return outcome == .manual ? 120 : 30
         } catch {
-            session.event("Bluetooth wake failed", "\(error)", op: "ble", level: "warn")
+            session.event(error is WifiJoin.Failure ? "Wi-Fi join failed" : "Bluetooth wake failed", "\(error)", op: "ble", level: "warn")
             bleFailure = "\(error)"
+            bleError = error
             if case BLEError.pairedElsewhere = error { bluetoothNeedsPairing = true }
             // Still try the Wi-Fi briefly, in case this device already joined the camera by hand.
             return 4
+        }
+    }
+
+    /// Turns a known cause into words and a way out. Nil when the cause is the camera itself (off, out of range…).
+    static func hint(ble: Error?, localNetworkDenied: Bool) -> StopHint? {
+        let mac = ProcessInfo.processInfo.isMacCatalystApp
+        if localNetworkDenied {
+            return StopHint(symbol: "network.slash", title: "Local Network access is off",
+                            detail: mac ? "Allow Fuji Bridge in System Settings › Privacy & Security › Local Network."
+                                        : "Allow it in Settings › Fuji Bridge › Local Network.", opensSettings: !mac)
+        }
+        switch ble {
+        case BLEError.off?:
+            return StopHint(symbol: "antenna.radiowaves.left.and.right.slash", title: "Bluetooth is off",
+                            detail: "Turn it on in Control Center, or plug in the cable.")
+        case BLEError.unauthorized?:
+            return StopHint(symbol: "hand.raised", title: "Bluetooth is not allowed",
+                            detail: mac ? "Allow Fuji Bridge in System Settings › Privacy & Security › Bluetooth."
+                                        : "Allow it in Settings › Fuji Bridge › Bluetooth.", opensSettings: !mac)
+        case let failure as WifiJoin.Failure:
+            switch failure {
+            case .declined(let ssid):
+                return StopHint(symbol: "wifi.exclamationmark", title: "Wi-Fi join cancelled",
+                                detail: "Import again and tap Join, or pick \(ssid) in Settings › Wi-Fi.")
+            case .refused(let ssid, _), .notJoined(let ssid):
+                return StopHint(symbol: "wifi.exclamationmark", title: "Could not join \(ssid)",
+                                detail: "Pick it in Settings › Wi-Fi, come back, and import again. The password is on the camera's Wi-Fi screen.")
+            }
+        default:
+            return nil
         }
     }
 

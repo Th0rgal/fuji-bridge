@@ -152,4 +152,35 @@ final class BluetoothTests: XCTestCase {
         let wifi = try await FujiWake.run(gatt, token: nil) { _, _ in }
         XCTAssertEqual(wifi.ssid, "FUJIFILM-X100VI-1D7B8")
     }
+
+    // MARK: What the card says when an import stops
+
+    @MainActor
+    func testBluetoothOffAndDeniedAreNamed() {
+        XCTAssertEqual(BenchModel.hint(ble: BLEError.off, localNetworkDenied: false)?.title, "Bluetooth is off")
+        XCTAssertEqual(BenchModel.hint(ble: BLEError.unauthorized, localNetworkDenied: false)?.title, "Bluetooth is not allowed")
+        // The camera itself being away is not something the hint can name.
+        XCTAssertNil(BenchModel.hint(ble: BLEError.notFound, localNetworkDenied: false))
+        XCTAssertNil(BenchModel.hint(ble: nil, localNetworkDenied: false))
+    }
+
+    @MainActor
+    func testWifiJoinFailuresAndLocalNetworkAreNamed() {
+        XCTAssertEqual(BenchModel.hint(ble: WifiJoin.Failure.declined("FUJIFILM-X100VI-1234"), localNetworkDenied: false)?.title, "Wi-Fi join cancelled")
+        XCTAssertEqual(BenchModel.hint(ble: WifiJoin.Failure.notJoined("FUJIFILM-X100VI-1234"), localNetworkDenied: false)?.title, "Could not join FUJIFILM-X100VI-1234")
+        // Local Network wins: the join worked, the socket was blocked.
+        XCTAssertEqual(BenchModel.hint(ble: nil, localNetworkDenied: true)?.title, "Local Network access is off")
+    }
+
+    func testPowerStates() {
+        XCTAssertEqual(BluetoothPower(.poweredOff), .off)
+        XCTAssertEqual(BluetoothPower(.unauthorized), .denied)
+        XCTAssertEqual(BluetoothPower(.poweredOn), .on)
+        XCTAssertEqual(BluetoothPower(.resetting), .unknown)
+    }
+
+    func testNotOnTheCameraNetworkByDefault() {
+        // The test host is never on 192.168.0.x from the camera: the join check must say no rather than guess.
+        XCTAssertFalse(WifiJoin.hasAddress(near: "10.254.254.1"))
+    }
 }

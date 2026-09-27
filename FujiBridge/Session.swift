@@ -102,11 +102,14 @@ struct RunOptions: Sendable {
     /// Set to list the card instead of copying it: each frame's ObjectInfo and thumbnail come back here.
     var preview: (@Sendable (CardPhoto) -> Void)? = nil
     var progress: (@Sendable (LiveProgress) -> Void)? = nil
+    /// The session's clock origin, so the importer's lines and the app's events share one timeline in the
+    /// report. Without it the socket's lines restart at 0 when the import starts, after the Bluetooth wake.
+    var clockOrigin: UInt64? = nil
 }
 
 enum Importer {
     static func run(link: ByteLink, options: RunOptions, log: @escaping (TraceLine) -> Void) async -> RunResult {
-        let io = IO(link: link, log: log)
+        let io = IO(link: link, log: log, origin: options.clockOrigin)
         io.transport = options.transport
         let usb = options.transport == .usb
         let wire = usb ? "USB" : "TCP \(options.host):\(Fuji.port)"
@@ -216,6 +219,18 @@ enum Importer {
             } catch {
                 io.fail("Init read failed", IO.describe(error), op: "init", took: io.now() - initStart)
                 await link.close()
+                // A body just woken over Bluetooth can accept the socket and never answer it (seen on an
+                // X100VI, 27 Sept: 30 s of silence after a Local Network prompt). A fresh socket and a fresh
+                // init is what XApp's retry does; the camera answers the new one or refuses it outright.
+                if kind == .bridge && options.live && attempt < attempts - 1 {
+                    io.note("Reconnect", "No answer to the init. Opening a new socket and sending it again.", op: "reconnect")
+                    do {
+                        try await link.open()
+                        continue
+                    } catch {
+                        return RunResult(ok: false, reason: "link", summary: "Reconnect failed. \(IO.describe(error))", files: files)
+                    }
+                }
                 return RunResult(ok: false, reason: "link", summary: "Init read failed. \(IO.describe(error))", files: files)
             }
         }
@@ -648,15 +663,16 @@ private final class IO: @unchecked Sendable {
     var transport: Transport = .wifi
     /// Frame the next lines belong to.
     var file = ""
-    private let origin = DispatchTime.now().uptimeNanoseconds
+    private let origin: UInt64
     private let lock = NSLock()
     private var seq = 1
     /// When the length word of the last packet arrived. Partial reads use it for time to first byte.
     private var headAt = 0.0
 
-    init(link: ByteLink, log: @escaping (TraceLine) -> Void) {
+    init(link: ByteLink, log: @escaping (TraceLine) -> Void, origin: UInt64? = nil) {
         self.link = link
         self.log = log
+        self.origin = origin ?? DispatchTime.now().uptimeNanoseconds
     }
 
     func now() -> Double {

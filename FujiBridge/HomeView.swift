@@ -20,6 +20,10 @@ struct HomeView: View {
     @State private var confirmDelete = false
     /// Mac only: the sidebar's Diagnostics row pushes onto the detail column.
     @State private var showDiagnostics = false
+    /// On the phone the camera card and the tab header scroll with the grid: their height, so an empty
+    /// state can take exactly what is left of the screen instead of a full screen below them.
+    @State private var cardHeight: CGFloat = 0
+    @State private var headerHeight: CGFloat = 0
     @State private var deleteError: String?
     /// Target row height of the grid. Command-plus and Command-minus, or a pinch.
     @AppStorage("BridgeRowHeight") private var zoom: Double = 0
@@ -217,6 +221,10 @@ struct HomeView: View {
 
     private var running: Bool { model.busy && model.mode == .camera }
 
+    private func openSettings() {
+        if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+    }
+
     private var cardHeader: some View {
         HStack(alignment: .center, spacing: 11) {
             Image(systemName: cameraIcon)
@@ -286,15 +294,38 @@ struct HomeView: View {
             CardLine(symbol: "link.badge.plus", tint: Ink.bad, text: "Paired with another device", detail: "Camera: Bluetooth › Pairing registration") {
                 SmallPill(title: "Pair", symbol: nil) { model.pairBluetooth() }.disabled(model.busy)
             }
+        } else if model.usbCamera == nil && model.bluetoothEnabled && model.bluetoothPower == .off {
+            // Said here, before Import, rather than as "camera not reachable" after a wasted attempt.
+            CardLine(symbol: "antenna.radiowaves.left.and.right.slash", tint: Ink.bad, text: "Bluetooth is off",
+                     detail: "Turn it on in Control Center, or plug in the cable.") { EmptyView() }
+        } else if model.usbCamera == nil && model.bluetoothEnabled && model.bluetoothPower == .denied {
+            CardLine(symbol: "hand.raised", tint: Ink.bad, text: "Bluetooth is not allowed",
+                     detail: Ink.isMac ? "System Settings › Privacy & Security › Bluetooth" : "Settings › Fuji Bridge › Bluetooth") {
+                if !Ink.isMac { SmallPill(title: "Settings", symbol: nil) { openSettings() } }
+            }
         } else if !connected {
-            CardLine(symbol: "hand.point.up.left", tint: Ink.muted, text: "Plug in or switch on", detail: model.bluetoothEnabled ? "Not showing? Turn Bluetooth off on your phone." : nil) {
+            // On a Mac the phone may hold the camera's Bluetooth bond; on the phone that hint makes no sense.
+            CardLine(symbol: "hand.point.up.left", tint: Ink.muted, text: "Plug in or switch on",
+                     detail: model.bluetoothEnabled && Ink.isMac ? "Not showing? Turn Bluetooth off on your phone." : nil) {
                 if !model.bluetoothEnabled {
                     SmallPill(title: nil, symbol: "antenna.radiowaves.left.and.right") { model.enableBluetooth() }
                         .help("Find the camera over Bluetooth")
                 }
             }
         }
-        if model.mode == .camera, let summary = model.summary, model.purpose != .browse || model.phase == "Stopped" {
+        if model.mode == .camera, model.summary != nil, summaryTone == .bad, let hint = model.stopHint {
+            CardLine(symbol: hint.symbol, tint: Ink.bad, text: hint.title, detail: hint.detail) {
+                if hint.opensSettings {
+                    SmallPill(title: "Settings", symbol: nil) { openSettings() }
+                } else {
+                    Button { model.summary = nil } label: {
+                        Image(systemName: "xmark").font(.system(size: 10, weight: .bold)).foregroundStyle(Ink.muted)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Dismiss")
+                }
+            }
+        } else if model.mode == .camera, let summary = model.summary, model.purpose != .browse || model.phase == "Stopped" {
             CardLine(symbol: summaryTone == .bad ? "exclamationmark.triangle.fill" : "checkmark.circle.fill",
                      tint: summaryTone == .bad ? Ink.bad : Ink.good, text: resultTitle, detail: resultDetail ?? summary) {
                 Button { model.summary = nil } label: {
@@ -502,6 +533,7 @@ struct HomeView: View {
                         .padding(.horizontal, 16)
                         .padding(.top, 8)
                         .padding(.bottom, 18)
+                        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { cardHeight = $0 }
                 }
                 Section {
                     gallery(rowHeight: rowHeight(wide: wide))
@@ -513,6 +545,7 @@ struct HomeView: View {
                     galleryHeader
                         .padding(.horizontal, pad)
                         .padding(.vertical, 10)
+                        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { headerHeight = $0 }
                         .background(Ink.paper)
                         .overlay(alignment: .bottom) { Rectangle().fill(Ink.rule.opacity(0.6)).frame(height: 0.5) }
                     }
@@ -624,6 +657,13 @@ struct HomeView: View {
     }
 
     /// Nothing to show: centered in the visible area, one sentence of why, and the button that fixes it.
+    /// Height above and below the empty state inside the scroll view: the gallery's bottom padding, plus the
+    /// camera card and the header where they scroll along (phone). Wide layouts keep them outside.
+    private var emptyReserve: CGFloat {
+        let wide = Ink.isMac || UIDevice.current.userInterfaceIdiom == .pad
+        return wide ? 40 : cardHeight + headerHeight + 24 + 4
+    }
+
     private func empty(_ title: String, _ detail: String, icon: String, action: (String, String, () -> Void)? = nil) -> some View {
         VStack(spacing: 12) {
             Image(systemName: icon)
@@ -658,10 +698,14 @@ struct HomeView: View {
                 .padding(.top, 8)
             }
         }
-        .padding(32)
+        .padding(.horizontal, 32)
+        .padding(.vertical, 20)
         .frame(maxWidth: .infinity)
-        // Fill what the scroll view shows, so the message sits in the middle rather than at the top.
-        .containerRelativeFrame(.vertical, alignment: .center) { height, _ in max(height - 40, 300) }
+        // Fill what the scroll view still shows below the card and the header (on the phone they scroll with
+        // it), so the message sits in the middle of the free space and nothing scrolls when there is nothing.
+        .containerRelativeFrame(.vertical, alignment: .center) { height, _ in
+            max(height - emptyReserve, 240)
+        }
     }
 
     // MARK: Selection

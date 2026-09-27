@@ -10,6 +10,9 @@ final class LoopbackCamera: @unchecked Sendable {
     private var listener: NWListener?
     private var connections: [NWConnection] = []
     private(set) var accepted = 0
+    /// The first N sockets are accepted and read but never answered, like a body that woke over Bluetooth
+    /// and stopped listening before the phone arrived.
+    var muteFirst = 0
 
     init(body: VirtualBody) {
         self.body = body
@@ -50,7 +53,7 @@ final class LoopbackCamera: @unchecked Sendable {
         body.noteConnect()
         connection.start(queue: queue)
         var incoming = Data()
-        var silent = false
+        var silent = accepted <= muteFirst
         func pump() {
             connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { [weak self] data, _, done, error in
                 guard let self, error == nil else { return }
@@ -113,6 +116,27 @@ final class LoopbackTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(started), 8)
         let size = try FileManager.default.attributesOfItem(atPath: dir.appendingPathComponent("DSCF4436.JPG").path)[.size] as? Int
         XCTAssertEqual(size, 2_500_000)
+    }
+
+    func testASilentInitGetsANewSocket() async throws {
+        let body = VirtualBody(faults: .none, control: RunControl(), frames: frames)
+        let camera = LoopbackCamera(body: body)
+        camera.muteFirst = 1
+        let port = try await camera.start()
+        defer { camera.stop() }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let control = RunControl()
+        control.ok = true
+        let recorder = Recorder()
+        let result = await Importer.run(
+            link: TCPLink(host: "127.0.0.1", port: port, connectTimeout: 2, readTimeout: 1),
+            options: RunOptions(kind: .bridge, frames: [], faults: .none, control: control, live: true, saveDirectory: dir, host: "127.0.0.1"),
+            log: recorder.add
+        )
+        XCTAssertTrue(result.ok, result.summary)
+        XCTAssertEqual(camera.accepted, 2)
+        XCTAssertTrue(recorder.lines.contains { $0.title == "Reconnect" && $0.op == "reconnect" })
     }
 
     func testNothingListeningFailsFastWithAReason() async throws {
