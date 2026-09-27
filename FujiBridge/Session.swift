@@ -220,7 +220,9 @@ enum Importer {
                     handles = Array(handles.suffix(latest))
                 }
             }
-            queue = handles.map { handle in
+            // The body lists oldest first. Newest first instead: the photos just taken are the ones wanted,
+            // and a run that stops halfway has already brought them.
+            queue = handles.reversed().map { handle in
                 if let known = options.frames.first(where: { $0.handle == handle }) {
                     return known
                 }

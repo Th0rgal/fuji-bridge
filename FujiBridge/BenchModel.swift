@@ -280,6 +280,7 @@ final class BenchModel {
         guard busy, let session else { return }
         // A hidden Mac window keeps running; a phone app in the background is suspended within seconds.
         let suspends = phase == "background" && !ProcessInfo.processInfo.isMacCatalystApp
+        if suspends { leftScreen = true }
         session.event("App \(phase)", suspends
             ? "Left the screen during the import. iOS will suspend the socket once background time runs out."
             : "Scene is \(phase).", level: suspends ? "warn" : "info")
@@ -312,14 +313,16 @@ final class BenchModel {
         var preview: (@Sendable (CardPhoto) -> Void)?
         var cardCount: (@Sendable (Int) -> Void)?
         if purpose == .browse {
-            // The camera sends each batch oldest first. A first listing grows from the top; a "load more" batch
-            // is older than everything shown, so it grows from the bottom of what is there.
-            let base = browseSkip
+            // Each batch arrives newest first. A first listing starts at the top; a "load more" batch is older
+            // than everything shown, so it continues below what is there. Either way each photo goes after the last.
+            browseCursor = browseSkip
             let known = Set(cameraPhotos.map(\.handle))
             preview = { [weak self] photo in
                 Task { @MainActor [weak self] in
                     guard let self, !known.contains(photo.handle) else { return }
-                    self.cameraPhotos.insert(photo, at: min(base, self.cameraPhotos.count))
+                    let at = min(self.browseCursor, self.cameraPhotos.count)
+                    self.cameraPhotos.insert(photo, at: at)
+                    self.browseCursor = at + 1
                 }
             }
             cardCount = { [weak self] count in
@@ -377,6 +380,7 @@ final class BenchModel {
                 self.bleFailure = nil
                 self.bleError = nil
                 self.stopHint = nil
+                self.leftScreen = false
                 // Bluetooth on: look for the body even if it has not been heard yet (it may have just woken up).
                 if transport == .wifi && self.bluetoothEnabled {
                     connectTimeout = await self.wakeAndJoin(session)
@@ -459,7 +463,8 @@ final class BenchModel {
             summary = result.summary
             if !result.ok, let bleFailure { summary = "Bluetooth: \(bleFailure) Then Wi-Fi: \(result.summary)" }
             if !result.ok && mode != .virtual && transport == .wifi {
-                stopHint = Self.hint(ble: bleError, localNetworkDenied: lastLocalNetworkDenied)
+                stopHint = (leftScreen ? Self.leftScreenHint : nil)
+                    ?? Self.hint(ble: bleError, localNetworkDenied: lastLocalNetworkDenied)
                     ?? Self.silentCameraHint(result)
             }
             joinByHand = false
@@ -493,6 +498,26 @@ final class BenchModel {
         saved = Self.photos()
     }
 
+    /// This run went to the background on iOS at some point.
+    @ObservationIgnored private var leftScreen = false
+
+    /// iOS refuses a network join from an app that is not on screen ("application is not in the foreground").
+    /// If the user switched away while the camera was waking, wait for them to come back, then join.
+    private func waitForScreen(_ ssid: String, _ session: SessionLog) async {
+        #if !targetEnvironment(macCatalyst)
+        guard UIApplication.shared.applicationState != .active else { return }
+        session.event("Waiting to join", "iOS only joins \(ssid) while Fuji Bridge is on screen. Waiting for it to come back.", op: "ble", level: "warn")
+        phase = "Open Fuji Bridge to join \(ssid)"
+        let deadline = Date().addingTimeInterval(300)
+        while UIApplication.shared.applicationState != .active, Date() < deadline, !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        phase = "Joining \(ssid)"
+        #endif
+    }
+
+    /// Where the next thumbnail of the running listing goes in `cameraPhotos`.
+    @ObservationIgnored private var browseCursor = 0
     /// Trace time of the first OK poll in the current wait.
     @ObservationIgnored private var okWaitSince: Double?
     /// The running import saves into the library, so its files belong in Imported.
@@ -549,6 +574,7 @@ final class BenchModel {
             cameraWifi = wifi
             session.event("Wi-Fi woken", "\(wifi.ssid) in \(Int(Date().timeIntervalSince(start) * 1000)) ms over Bluetooth.", op: "ble")
             phase = "Joining \(wifi.ssid)"
+            await waitForScreen(wifi.ssid, session)
             let outcome = try await WifiJoin.join(wifi, host: host) { title, detail in session.event(title, detail, op: "ble") }
             joinByHand = outcome == .manual
             session.event(outcome == .joined ? "Wi-Fi joined" : "Join by hand", outcome == .joined
@@ -598,6 +624,10 @@ final class BenchModel {
 
     /// The socket opened but the body never answered the init, or shut its server during the retries
     /// (seen 27 Sept on an X100VI whose Wi-Fi was already up). Not "unreachable": the camera is right there.
+    /// iOS will not join a network for an app in the background, and suspends its socket soon after.
+    static let leftScreenHint = StopHint(symbol: "iphone", title: "Fuji Bridge left the screen",
+                                         detail: "iOS pauses the Wi-Fi when you switch apps. Keep Fuji Bridge open until the import is done.")
+
     static func silentCameraHint(_ result: RunResult) -> StopHint? {
         guard result.summary.hasPrefix("Init read failed") || result.summary.hasPrefix("Reconnect failed") else { return nil }
         return StopHint(symbol: "camera", title: "The camera did not answer",

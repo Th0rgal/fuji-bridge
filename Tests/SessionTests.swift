@@ -180,10 +180,10 @@ final class SessionTests: XCTestCase {
         ]
         let (result, body, _) = await observe(.bridge, frames: [], bodyFrames: frames, faults: .none, autoOK: true, live: true)
         XCTAssertTrue(result.ok)
-        XCTAssertEqual(result.files.map(\.handle), [4, 9])
-        XCTAssertEqual(result.files.map(\.name), ["DSCF4436.JPG", "DSCF4490.JPG"])
-        XCTAssertEqual(result.files[0].got, 1_800_000)
-        XCTAssertEqual(result.files[1].got, 500_000)
+        XCTAssertEqual(result.files.map(\.handle), [9, 4])
+        XCTAssertEqual(result.files.map(\.name), ["DSCF4490.JPG", "DSCF4436.JPG"])
+        XCTAssertEqual(result.files[1].got, 1_800_000)
+        XCTAssertEqual(result.files[0].got, 500_000)
         XCTAssertFalse(body.partials.contains { $0.handle == 1 || $0.handle == 2 })
     }
 
@@ -199,8 +199,8 @@ final class SessionTests: XCTestCase {
             listed: []
         )
         XCTAssertTrue(result.ok)
-        XCTAssertEqual(result.files.map(\.handle), [1, 2])
-        XCTAssertEqual(body.partials.map(\.handle), [1, 1, 1, 2, 2])
+        XCTAssertEqual(result.files.map(\.handle), [2, 1])
+        XCTAssertEqual(body.partials.map(\.handle), [2, 2, 1, 1, 1])
     }
 
     func testLiveSkipsADeadHandleAndKeepsTheNext() async {
@@ -219,9 +219,9 @@ final class SessionTests: XCTestCase {
         )
         XCTAssertTrue(result.ok)
         XCTAssertEqual(result.files.map(\.state), ["full", "skipped", "full"])
-        XCTAssertEqual(result.files.map(\.name), ["DSCF4436.JPG", "DSCF0000.JPG", "DSCF4490.JPG"])
+        XCTAssertEqual(result.files.map(\.name), ["DSCF4490.JPG", "DSCF0000.JPG", "DSCF4436.JPG"])
         XCTAssertFalse(body.partials.contains { $0.handle == 0 })
-        XCTAssertEqual(body.partials.map(\.handle), [4, 4, 9])
+        XCTAssertEqual(body.partials.map(\.handle), [9, 4, 4])
     }
 
     func testLiveReadsObjectCountWhenOkAlreadyLanded() async {
@@ -237,7 +237,7 @@ final class SessionTests: XCTestCase {
         )
         XCTAssertTrue(result.ok)
         XCTAssertEqual(result.reason, "imported")
-        XCTAssertEqual(result.files.map(\.handle), [1, 2])
+        XCTAssertEqual(result.files.map(\.handle), [2, 1])
     }
 
     func testLiveWithNothingListedFailsClearly() async {
@@ -332,7 +332,7 @@ final class SessionTests: XCTestCase {
             log: { _ in }
         )
         XCTAssertTrue(result.ok)
-        XCTAssertEqual(result.files.map(\.state), ["already", "full"])
+        XCTAssertEqual(result.files.map(\.state), ["full", "already"])
         XCTAssertEqual(body.partials.map(\.handle), [9])
     }
 

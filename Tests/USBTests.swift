@@ -80,7 +80,7 @@ final class USBTests: XCTestCase {
             log: { lines.append($0) }
         )
         XCTAssertTrue(result.ok, result.summary)
-        XCTAssertEqual(result.files.map(\.name), ["DSCF0010.JPG", "DSCF0011.JPG", "DSCF0012.JPG"])
+        XCTAssertEqual(result.files.map(\.name), ["DSCF0012.JPG", "DSCF0011.JPG", "DSCF0010.JPG"])
         XCTAssertEqual(result.files.map(\.state), ["full", "full", "full"])
         for file in camera.files {
             XCTAssertEqual(try Data(contentsOf: dir.appendingPathComponent(file.name)), file.bytes, file.name)
@@ -108,8 +108,8 @@ final class USBTests: XCTestCase {
             log: { _ in }
         )
         XCTAssertTrue(result.ok, result.summary)
-        XCTAssertEqual(result.files.map(\.name), ["B.JPG", "C.JPG"])
-        XCTAssertEqual(result.files.map(\.state), ["full", "already"])
+        XCTAssertEqual(result.files.map(\.name), ["C.JPG", "B.JPG"])
+        XCTAssertEqual(result.files.map(\.state), ["already", "full"])
         XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("A.JPG").path))
     }
 
@@ -128,8 +128,8 @@ final class USBTests: XCTestCase {
         )
         XCTAssertTrue(browse.ok)
         XCTAssertEqual(browse.reason, "previewed")
-        XCTAssertEqual(seen.photos.map(\.name), ["B.JPG", "C.JPG"])
-        XCTAssertEqual(seen.photos.map(\.bytes), [6000, 7000])
+        XCTAssertEqual(seen.photos.map(\.name), ["C.JPG", "B.JPG"])
+        XCTAssertEqual(seen.photos.map(\.bytes), [7000, 6000])
         XCTAssertTrue(camera.codes.contains(Fuji.getThumb))
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path), [])
 

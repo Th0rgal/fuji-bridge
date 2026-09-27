@@ -356,57 +356,63 @@ struct HomeView: View {
         actionRow
     }
 
-    /// Import, with its scope folded into the same button, and Browse beside it as an icon.
+    /// Reading the card is the main action: look first, then import what you pick. With a selection the same
+    /// button imports it. Quick import (the newest not here yet, no looking) sits beside it as an icon.
     private var actionRow: some View {
         HStack(spacing: 8) {
             HStack(spacing: 0) {
-                Button { model.importFromCamera() } label: {
-                    Label(model.selection.isEmpty ? "Import" : "Import \(model.selection.count)", systemImage: "arrow.down.to.line")
+                Button {
+                    if model.selection.isEmpty {
+                        tab = .camera
+                        model.browse()
+                    } else {
+                        model.importFromCamera()
+                    }
+                } label: {
+                    Label(model.selection.isEmpty ? "Read the card" : "Import \(model.selection.count)",
+                          systemImage: model.selection.isEmpty ? "square.grid.2x2" : "arrow.down.to.line")
                         .font(Ink.side(.title, .semibold))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 9)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                if model.selection.isEmpty {
-                    Rectangle().fill(Ink.paper.opacity(0.25)).frame(width: 1, height: 18)
-                    Menu {
-                        Picker("Photos", selection: $model.scope) {
-                            ForEach(Scope.allCases) { Text($0.label).tag($0) }
+                Rectangle().fill(Ink.paper.opacity(0.25)).frame(width: 1, height: 18)
+                Menu {
+                    Picker("Photos", selection: $model.scope) {
+                        ForEach(Scope.allCases) { Text($0.label).tag($0) }
+                    }
+                    .pickerStyle(.inline)
+                    Section("Size over Wi-Fi") {
+                        Picker("Size over Wi-Fi", selection: $model.importSize) {
+                            ForEach(ImportSize.allCases) { size in
+                                Text(size == .small ? "Resized S (recommended)" : size.label).tag(size)
+                            }
                         }
                         .pickerStyle(.inline)
-                        Section("Size over Wi-Fi") {
-                            Picker("Size over Wi-Fi", selection: $model.importSize) {
-                                ForEach(ImportSize.allCases) { size in
-                                    Text(size == .small ? "Resized S (recommended)" : size.label).tag(size)
-                                }
-                            }
-                            .pickerStyle(.inline)
-                            .labelsHidden()
-                        }
-                    } label: {
-                        HStack(spacing: 3) {
-                            Text(scopeShort).font(Ink.side(.title, .semibold)).monospacedDigit()
-                            Image(systemName: "chevron.down").font(.system(size: 9, weight: .bold))
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 9)
-                        .contentShape(Rectangle())
+                        .labelsHidden()
                     }
-                    .menuStyle(.button)
-                    .buttonStyle(.plain)
-                    .menuIndicator(.hidden)
-                    .fixedSize()
-                    .help("How much of the card to look at, and at what size")
+                } label: {
+                    HStack(spacing: 3) {
+                        Text(scopeShort).font(Ink.side(.title, .semibold)).monospacedDigit()
+                        Image(systemName: "chevron.down").font(.system(size: 9, weight: .bold))
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 9)
+                    .contentShape(Rectangle())
                 }
+                .menuStyle(.button)
+                .buttonStyle(.plain)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("How much of the card to read, and the size photos are imported at")
             }
             .foregroundStyle(Ink.paper)
             .background(Ink.ink, in: Capsule())
             Button {
-                tab = .camera
-                model.browse()
+                model.importFromCamera()
             } label: {
-                Image(systemName: "square.grid.2x2")
+                Image(systemName: "arrow.down.to.line")
                     .font(.system(size: 15, weight: .medium))
                     .frame(width: 38, height: 38)
                     .background(Ink.paper, in: Circle())
@@ -414,8 +420,10 @@ struct HomeView: View {
             }
             .buttonStyle(InkPress())
             .foregroundStyle(Ink.ink)
-            .help(model.cameraPhotos.isEmpty ? "Browse the camera" : "Browse again")
-            .accessibilityLabel("Browse the camera")
+            .help("Import the newest photos that are not here yet, without looking first")
+            .accessibilityLabel("Import new photos")
+            .opacity(model.selection.isEmpty ? 1 : 0)
+            .disabled(!model.selection.isEmpty)
         }
         .disabled(model.busy)
         .opacity(model.busy ? 0.4 : 1)
@@ -493,6 +501,9 @@ struct HomeView: View {
         if phase.hasPrefix("Press OK") { return "Press OK on the camera" }
         if phase.hasPrefix("Waiting for the camera's pairing") { return "Open Pairing registration on the camera" }
         if phase.hasPrefix("Looking") { return "Switch the camera on" }
+        if !Ink.isMac && (phase.hasPrefix("Waking") || phase.hasPrefix("Joining") || phase.hasPrefix("Open Fuji Bridge")) {
+            return "Keep Fuji Bridge open while it connects"
+        }
         if let p = model.progress, p.count > 0, model.purpose != .browse { return p.name }
         return nil
     }
@@ -523,7 +534,7 @@ struct HomeView: View {
         if model.runTransport == .usb { return stage("open") }
         if model.bluetoothEnabled {
             if phase.hasPrefix("Waking") { return stage("wake") }
-            if phase.hasPrefix("Join") || phase == "Connecting" { return stage("join") }
+            if phase.hasPrefix("Join") || phase.hasPrefix("Open Fuji Bridge") || phase == "Connecting" { return stage("join") }
             return stage("find")
         }
         return stage("reach")
@@ -688,8 +699,8 @@ struct HomeView: View {
         switch tab {
         case .imported:
             if model.saved.isEmpty {
-                empty("Nothing imported yet", "Photos you import land in \(Ink.isMac ? "Pictures › Fuji Bridge" : "Files › Fuji Bridge"), newest first.", icon: "photo.on.rectangle.angled",
-                      action: ("Import new photos", "arrow.down.to.line", { model.importFromCamera() }))
+                empty("Nothing imported yet", "Read the card, pick photos, and they land in \(Ink.isMac ? "Pictures › Fuji Bridge" : "Files › Fuji Bridge"), newest first.", icon: "photo.on.rectangle.angled",
+                      action: ("Read the card", "square.grid.2x2", { tab = .camera; model.browse() }))
             } else {
                 JustifiedGrid(items: model.saved.map(LocalItem.init), ratio: { ratios[$0.url] ?? ImageRatio.standard }, rowHeight: rowHeight) { item, _ in
                     let url = item.url
@@ -709,8 +720,8 @@ struct HomeView: View {
                 if model.busy && model.purpose == .browse {
                     empty("Reading the card", "Thumbnails appear here as the camera sends them.", icon: "ellipsis")
                 } else {
-                    empty("See the card before importing", "Browse the camera to look at its photos and pick the ones to copy. Fuji Bridge lists the \(model.scope == .all ? "whole card" : model.scope.label.lowercased()), as set on the left.", icon: "camera",
-                          action: ("Browse the camera", "square.grid.2x2", { model.browse() }))
+                    empty("See the card before importing", "Read the card to see its photos, then pick the ones to import. Fuji Bridge reads the \(model.scope == .all ? "whole card" : model.scope.label.lowercased()), as set next to the button.", icon: "camera",
+                          action: ("Read the card", "square.grid.2x2", { model.browse() }))
                 }
             } else {
                 cardBar
