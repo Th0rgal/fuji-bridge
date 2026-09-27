@@ -1,10 +1,10 @@
 import XCTest
-@testable import Latch
+@testable import FujiBridge
 
 final class SessionTests: XCTestCase {
-    func testLatchSurvivesFlakyInitAndStall() async {
+    func testBridgeSurvivesFlakyInitAndStall() async {
         let result = await run(
-            .latch,
+            .bridge,
             handles: [1, 5],
             faults: Faults(flakyHandshake: true, requireOk: true, stallChunk: true, lieAboutSize: true, impatientOpen: false),
             autoOK: true
@@ -55,17 +55,17 @@ final class SessionTests: XCTestCase {
         XCTAssertEqual(rows.count, 5)
         let flaky = rows.first { $0.id == "flaky" }
         XCTAssertEqual(flaky?.xappOk, false)
-        XCTAssertEqual(flaky?.latchOk, true)
+        XCTAssertEqual(flaky?.bridgeOk, true)
         let stall = rows.first { $0.id == "stall" }
         XCTAssertEqual(stall?.xappOk, false)
-        XCTAssertEqual(stall?.latchOk, true)
+        XCTAssertEqual(stall?.bridgeOk, true)
         let waiting = rows.first { $0.id == "ok" }
         XCTAssertEqual(waiting?.xappOk, false)
-        XCTAssertEqual(waiting?.latchOk, true)
+        XCTAssertEqual(waiting?.bridgeOk, true)
     }
 
     func testInitPacketIs82BytesWithoutALengthPrefix() {
-        let packet = Packets.initCommand(name: "Latch")
+        let packet = Packets.initCommand(name: "Fuji Bridge")
         XCTAssertEqual(packet.count, 82)
         XCTAssertEqual(LE.u32(packet, 0), 0x52)
         XCTAssertEqual(LE.u32(packet, 4), 1)
@@ -74,10 +74,10 @@ final class SessionTests: XCTestCase {
         XCTAssertEqual(LE.u32(packet, 16), 0x0b7fb287)
         XCTAssertEqual(LE.u32(packet, 20), 0xd0ded5d3)
         XCTAssertEqual(LE.u32(packet, 24), 0)
-        XCTAssertEqual(packet[28], 0x4c)
+        XCTAssertEqual(packet[28], 0x46)
         XCTAssertEqual(packet[29], 0)
         XCTAssertNotEqual(packet[28], 5)
-        XCTAssertEqual(packet[38], 0)
+        XCTAssertEqual(packet[50], 0)
     }
 
     func testEventsDoNotTreatTheObjectCountAsCameraState() {
@@ -113,7 +113,7 @@ final class SessionTests: XCTestCase {
 
     func testPartialWindowsForTheAlleyFrame() async {
         let frame = Catalog.roll[0]
-        let (result, body, _) = await observe(.latch, frames: [frame], faults: .none, autoOK: true)
+        let (result, body, _) = await observe(.bridge, frames: [frame], faults: .none, autoOK: true)
         XCTAssertTrue(result.ok)
         XCTAssertEqual(body.partials.map(\.offset), [0, 0x10_0000, 0x20_0000])
         XCTAssertEqual(body.partials.map(\.ask), [0x10_0000, 0x10_0000, 302_848])
@@ -125,7 +125,7 @@ final class SessionTests: XCTestCase {
     func testReconnectResetsTheTransactionId() async {
         let frame = Catalog.roll[0]
         let faults = Faults(flakyHandshake: true, requireOk: false, stallChunk: true, lieAboutSize: true, impatientOpen: false)
-        let (result, body, lines) = await observe(.latch, frames: [frame], faults: faults, autoOK: true)
+        let (result, body, lines) = await observe(.bridge, frames: [frame], faults: faults, autoOK: true)
         XCTAssertTrue(result.ok)
         XCTAssertEqual(result.files[0].state, "full")
         XCTAssertEqual(result.files[0].got, frame.bytes)
@@ -141,7 +141,7 @@ final class SessionTests: XCTestCase {
             CardFrame(handle: 4, name: "DSCF4436.JPG", bytes: 1_800_000, recipe: "Velvia"),
             CardFrame(handle: 9, name: "DSCF4490.JPG", bytes: 500_000, recipe: "Acros"),
         ]
-        let (result, body, _) = await observe(.latch, frames: [], bodyFrames: frames, faults: .none, autoOK: true, live: true)
+        let (result, body, _) = await observe(.bridge, frames: [], bodyFrames: frames, faults: .none, autoOK: true, live: true)
         XCTAssertTrue(result.ok)
         XCTAssertEqual(result.files.map(\.handle), [4, 9])
         XCTAssertEqual(result.files.map(\.name), ["DSCF4436.JPG", "DSCF4490.JPG"])
@@ -153,7 +153,7 @@ final class SessionTests: XCTestCase {
     func testLiveFallsBackToTheObjectCountWhenD621IsEmpty() async {
         let frames = Array(Catalog.roll.prefix(2))
         let (result, body, _) = await observe(
-            .latch,
+            .bridge,
             frames: [],
             bodyFrames: frames,
             faults: .none,
@@ -172,7 +172,7 @@ final class SessionTests: XCTestCase {
             CardFrame(handle: 9, name: "DSCF4490.JPG", bytes: 500_000, recipe: "Acros"),
         ]
         let (result, body, _) = await observe(
-            .latch,
+            .bridge,
             frames: [],
             bodyFrames: frames,
             faults: .none,
@@ -190,7 +190,7 @@ final class SessionTests: XCTestCase {
     func testLiveReadsObjectCountWhenOkAlreadyLanded() async {
         let frames = Array(Catalog.roll.prefix(2))
         let (result, _, _) = await observe(
-            .latch,
+            .bridge,
             frames: [],
             bodyFrames: frames,
             faults: .none,
@@ -204,7 +204,7 @@ final class SessionTests: XCTestCase {
     }
 
     func testLiveWithNothingListedFailsClearly() async {
-        let (result, _, _) = await observe(.latch, frames: [], bodyFrames: [], faults: .none, autoOK: true, live: true)
+        let (result, _, _) = await observe(.bridge, frames: [], bodyFrames: [], faults: .none, autoOK: true, live: true)
         XCTAssertFalse(result.ok)
         XCTAssertEqual(result.reason, "empty")
         XCTAssertTrue(result.summary.contains("D621"))
@@ -212,31 +212,118 @@ final class SessionTests: XCTestCase {
 
     func testInvalidHandleIsNotInvented() async {
         let ghost = CardFrame(handle: 0, name: "NOPE.JPG", bytes: 100, recipe: "")
-        let (result, body, _) = await observe(.latch, frames: [ghost], bodyFrames: Catalog.roll, faults: .none, autoOK: true)
+        let (result, body, _) = await observe(.bridge, frames: [ghost], bodyFrames: Catalog.roll, faults: .none, autoOK: true)
         XCTAssertEqual(result.reason, "object-info")
         XCTAssertEqual(result.files[0].state, "lost")
         XCTAssertTrue(body.partials.isEmpty)
     }
 
     func testAbortBeforeTheInit() async {
-        let (result, _, lines) = await observe(.latch, frames: [Catalog.roll[0]], faults: .none, autoOK: true, aborted: true)
+        let (result, _, lines) = await observe(.bridge, frames: [Catalog.roll[0]], faults: .none, autoOK: true, aborted: true)
         XCTAssertEqual(result.reason, "aborted")
         XCTAssertEqual(lines.last?.title, "Stopped")
     }
 
     func testEmptySelectionDoesNotOpen() async {
-        let (result, _, lines) = await observe(.latch, frames: [], faults: .none, autoOK: true)
+        let (result, _, lines) = await observe(.bridge, frames: [], faults: .none, autoOK: true)
         XCTAssertEqual(result.reason, "empty")
         XCTAssertTrue(lines.isEmpty)
     }
 
-    func testXAppStillTrustsTheSizeWhenLatchWouldNot() async {
+    func testXAppStillTrustsTheSizeWhenBridgeWouldNot() async {
         let faults = Faults(flakyHandshake: false, requireOk: false, stallChunk: false, lieAboutSize: true, impatientOpen: false)
         let (result, body, _) = await observe(.xapp, frames: [Catalog.roll[0]], faults: faults, autoOK: true)
         XCTAssertEqual(result.reason, "truncated")
         XCTAssertEqual(result.files[0].got, 102_400)
         XCTAssertEqual(body.infoSeen.first?.correct, 0)
         XCTAssertEqual(body.infoSeen.first?.reported, 102_400)
+    }
+
+    func testSlicedDataReadsFromItsOwnStart() {
+        var data = Data([0xaa, 0xbb, 0x34, 0x12, 0x00, 0x00])
+        data.removeFirst(2)
+        XCTAssertNotEqual(data.startIndex, 0)
+        XCTAssertEqual(LE.u32(data, 0), 0x1234)
+        XCTAssertEqual(LE.u16(data, 0), 0x1234)
+    }
+
+    func testTraceTimesAreRealAndExchangesAreTimed() async {
+        let (result, _, lines) = await observe(.bridge, frames: [Catalog.roll[0]], faults: .none, autoOK: true)
+        XCTAssertTrue(result.ok)
+        XCTAssertEqual(lines.map(\.ms), lines.map(\.ms).sorted())
+        let partials = lines.filter { $0.op == "partial" && $0.dir == "IN" }
+        XCTAssertEqual(partials.count, 3)
+        XCTAssertTrue(partials.allSatisfy { $0.took != nil && $0.firstByte != nil })
+        XCTAssertEqual(partials.map(\.bytes).reduce(0, +), Catalog.roll[0].bytes)
+        XCTAssertNotNil(lines.first { $0.op == "file" }?.took)
+    }
+
+    func testReportNamesTheStallAndTheInitFail() async {
+        let faults = Faults(flakyHandshake: true, requireOk: false, stallChunk: true, lieAboutSize: false, impatientOpen: false)
+        let (result, _, lines) = await observe(.bridge, frames: [Catalog.roll[0]], faults: faults, autoOK: true)
+        let log = SessionLog(label: "test")
+        lines.forEach(log.append)
+        log.close()
+        defer { try? FileManager.default.removeItem(at: log.jsonl) }
+        let info = DeviceInfo(app: "t", build: "1", bundle: "b", device: "d", system: "s", lowPower: false, thermal: "nominal", path: "p")
+        let report = Diagnostics.build(log: log, mode: "test", host: "virtual", environment: info, result: result)
+        XCTAssertTrue(report.findings.contains { $0.title.contains("stall") })
+        XCTAssertTrue(report.findings.contains { $0.title.contains("Init Fail") })
+        XCTAssertEqual(report.files.first?.stalls, 1)
+        XCTAssertEqual(report.copiedBytes, Catalog.roll[0].bytes)
+        XCTAssertTrue(report.phases.contains { $0.op == "partial" })
+        let text = Diagnostics.text(report)
+        XCTAssertTrue(text.contains("PHASES"))
+        XCTAssertTrue(text.contains("DSCF4418.JPG"))
+    }
+
+    func testAFileAlreadyOnThePhoneIsNotAskedAgain() async {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let frames = [
+            CardFrame(handle: 4, name: "DSCF4436.JPG", bytes: 1_800_000, recipe: ""),
+            CardFrame(handle: 9, name: "DSCF4490.JPG", bytes: 500_000, recipe: ""),
+        ]
+        try? Data(count: 1_800_000).write(to: dir.appendingPathComponent("DSCF4436.JPG"))
+        let control = RunControl()
+        control.ok = true
+        let body = VirtualBody(faults: .none, control: control, frames: frames)
+        let result = await Importer.run(
+            link: VirtualLink(body: body),
+            options: RunOptions(kind: .bridge, frames: [], faults: .none, control: control, live: true, saveDirectory: dir),
+            log: { _ in }
+        )
+        XCTAssertTrue(result.ok)
+        XCTAssertEqual(result.files.map(\.state), ["already", "full"])
+        XCTAssertEqual(body.partials.map(\.handle), [9])
+    }
+
+    func testAShortOddWindowIsRealignedBeforeTheNextRead() async {
+        let frame = Catalog.roll[0]
+        let control = RunControl()
+        control.ok = true
+        let body = VirtualBody(faults: .none, control: control, frames: [frame])
+        body.shortWindow = 1_234_567 - 1_048_576
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let result = await Importer.run(
+            link: VirtualLink(body: body),
+            options: RunOptions(kind: .bridge, frames: [frame], faults: .none, control: control, saveDirectory: dir),
+            log: { _ in }
+        )
+        XCTAssertTrue(result.ok)
+        XCTAssertEqual(result.files[0].got, frame.bytes)
+        XCTAssertTrue(body.partials.dropFirst().allSatisfy { $0.offset % 512 == 0 }, "\(body.partials.map(\.offset))")
+        let size = try? FileManager.default.attributesOfItem(atPath: dir.appendingPathComponent(frame.name).path)[.size] as? Int
+        XCTAssertEqual(size, frame.bytes)
+    }
+
+    func testMisalignmentIgnoresTheEndOfTheFile() {
+        XCTAssertEqual(Importer.misalignment(offset: 1_048_576, total: 5_000_000), 0)
+        XCTAssertEqual(Importer.misalignment(offset: 1_048_577, total: 5_000_000), 1)
+        XCTAssertEqual(Importer.misalignment(offset: 4_999_999, total: 4_999_999), 0)
     }
 
     private func run(_ kind: ClientKind, handles: [Int], faults: Faults, autoOK: Bool) async -> RunResult {

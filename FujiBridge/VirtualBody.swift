@@ -137,10 +137,17 @@ final class VirtualBody: @unchecked Sendable {
         }
     }
 
+    /// Test hook: the next window comes back this short, like a body that answers less than it was asked.
+    var shortWindow: Int?
+
     private func partial(handle: Int, offset: Int, ask: Int, code: UInt16, tid: UInt32) -> Reply {
         let total = frames.first { $0.handle == handle }?.bytes ?? ask
         let remain = max(0, total - offset)
-        let give = min(ask, remain)
+        var give = min(ask, remain)
+        if let short = shortWindow, short < give {
+            shortWindow = nil
+            give = short
+        }
         if stallArmed && give > Fuji.stallBytes {
             stallArmed = false
             let payload = Data(count: Fuji.stallBytes)
@@ -244,8 +251,8 @@ final class VirtualLink: ByteLink, @unchecked Sendable {
         while incoming.count >= 4 {
             let length = Int(LE.u32(incoming, 0))
             if length < 4 || incoming.count < length { return }
-            let packet = Data(incoming.prefix(length))
-            incoming.removeFirst(length)
+            let packet = incoming.subdata(in: incoming.startIndex..<(incoming.startIndex + length))
+            incoming = incoming.subdata(in: (incoming.startIndex + length)..<incoming.endIndex)
             switch body.handle(packet) {
             case .silent:
                 break
@@ -263,8 +270,8 @@ final class VirtualLink: ByteLink, @unchecked Sendable {
             if stalled { throw LinkError.stalled }
             throw LinkError.shortRead
         }
-        let chunk = Data(outgoing.prefix(count))
-        outgoing.removeFirst(count)
+        let chunk = outgoing.subdata(in: outgoing.startIndex..<(outgoing.startIndex + count))
+        outgoing = outgoing.subdata(in: (outgoing.startIndex + count)..<outgoing.endIndex)
         return chunk
     }
 }

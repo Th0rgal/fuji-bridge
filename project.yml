@@ -1,4 +1,4 @@
-name: Latch
+name: FujiBridge
 options:
   bundleIdPrefix: md.thomas
   deploymentTarget:
@@ -6,12 +6,12 @@ options:
   createIntermediateGroups: true
 
 schemes:
-  Latch:
+  FujiBridge:
     build:
       targets:
-        Latch: all
+        FujiBridge: all
     test:
-      targets: [LatchTests]
+      targets: [FujiBridgeTests]
     run:
       config: Debug
     archive:
@@ -21,8 +21,11 @@ settings:
   base:
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
-    PRODUCT_BUNDLE_IDENTIFIER: md.thomas.latch
-    TARGETED_DEVICE_FAMILY: "1"
+    PRODUCT_BUNDLE_IDENTIFIER: md.thomas.fujibridge
+    # iPhone, iPad, and the Mac through Catalyst ("Optimize for Mac"). One target, one set of sources.
+    TARGETED_DEVICE_FAMILY: "1,2,6"
+    SUPPORTS_MACCATALYST: YES
+    DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: BQ6Z84B8L5
     SWIFT_VERSION: "5.9"
@@ -30,30 +33,35 @@ settings:
     ENABLE_USER_SCRIPT_SANDBOXING: YES
 
 targets:
-  Latch:
+  FujiBridge:
     type: application
     platform: iOS
     sources:
-      - path: Latch
+      - path: FujiBridge
         excludes:
           - Info.plist
-          - Latch.entitlements
+          - "*.entitlements"
     settings:
       base:
-        INFOPLIST_FILE: Latch/Info.plist
+        INFOPLIST_FILE: FujiBridge/Info.plist
         GENERATE_INFOPLIST_FILE: NO
-        CODE_SIGN_ENTITLEMENTS: Latch/Latch.entitlements
-        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_ENTITLEMENTS: FujiBridge/FujiBridge.entitlements
+        # The Mac build is sandboxed and needs outgoing TCP. Debug may also listen, for the loopback camera in the tests.
+        "CODE_SIGN_ENTITLEMENTS[sdk=macosx*]": FujiBridge/FujiBridge-mac.entitlements
         SWIFT_VERSION: "5.9"
+      configs:
+        Debug:
+          "CODE_SIGN_ENTITLEMENTS[sdk=macosx*]": FujiBridge/FujiBridge-mac-debug.entitlements
 
-  LatchTests:
+  FujiBridgeTests:
     type: bundle.unit-test
     platform: iOS
     sources:
       - path: Tests
     dependencies:
-      - target: Latch
+      - target: FujiBridge
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: md.thomas.fujibridge.tests
         SWIFT_VERSION: "5.9"

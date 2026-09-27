@@ -8,7 +8,10 @@ enum Fuji {
     static let stallBytes = 64 * 1024
     static let liedSize = 102_400
 
+    static let getDeviceInfo: UInt16 = 0x1001
     static let openSession: UInt16 = 0x1002
+    static let getObjectHandles: UInt16 = 0x1007
+    static let getThumb: UInt16 = 0x100a
     static let getObjectInfo: UInt16 = 0x1008
     static let getProp: UInt16 = 0x1015
     static let setProp: UInt16 = 0x1016
@@ -16,6 +19,10 @@ enum Fuji {
     static let ok: UInt16 = 0x2001
     static let invalidObject: UInt16 = 0x2009
     static let sessionAlreadyOpen: UInt16 = 0x201e
+
+    static func okay(_ rc: UInt16) -> Bool {
+        rc == ok || rc == sessionAlreadyOpen
+    }
 
     static let getExtensionInfo: UInt16 = 0x9054
     static let getExtensionThumb: UInt16 = 0x9055
@@ -38,28 +45,34 @@ enum Fuji {
     static let importHandles: UInt32 = 0xd621
 }
 
+/// Little-endian helpers. Offsets are relative to `startIndex`: a `Data` that went through
+/// `removeFirst` or slicing keeps its old indices, and reading `data[0]` from it traps.
 enum LE {
     static func u16(_ data: Data, _ offset: Int) -> UInt16 {
-        UInt16(data[offset]) | (UInt16(data[offset + 1]) << 8)
+        let base = data.startIndex + offset
+        return UInt16(data[base]) | (UInt16(data[base + 1]) << 8)
     }
 
     static func u32(_ data: Data, _ offset: Int) -> UInt32 {
-        UInt32(data[offset])
-            | (UInt32(data[offset + 1]) << 8)
-            | (UInt32(data[offset + 2]) << 16)
-            | (UInt32(data[offset + 3]) << 24)
+        let base = data.startIndex + offset
+        return UInt32(data[base])
+            | (UInt32(data[base + 1]) << 8)
+            | (UInt32(data[base + 2]) << 16)
+            | (UInt32(data[base + 3]) << 24)
     }
 
     static func put16(_ data: inout Data, _ offset: Int, _ value: UInt16) {
-        data[offset] = UInt8(value & 0xff)
-        data[offset + 1] = UInt8((value >> 8) & 0xff)
+        let base = data.startIndex + offset
+        data[base] = UInt8(value & 0xff)
+        data[base + 1] = UInt8((value >> 8) & 0xff)
     }
 
     static func put32(_ data: inout Data, _ offset: Int, _ value: UInt32) {
-        data[offset] = UInt8(value & 0xff)
-        data[offset + 1] = UInt8((value >> 8) & 0xff)
-        data[offset + 2] = UInt8((value >> 16) & 0xff)
-        data[offset + 3] = UInt8((value >> 24) & 0xff)
+        let base = data.startIndex + offset
+        data[base] = UInt8(value & 0xff)
+        data[base + 1] = UInt8((value >> 8) & 0xff)
+        data[base + 2] = UInt8((value >> 16) & 0xff)
+        data[base + 3] = UInt8((value >> 24) & 0xff)
     }
 
     static func data16(_ value: UInt16) -> Data {
@@ -110,7 +123,7 @@ enum Packets {
         LE.put16(&data, 4, 2)
         LE.put16(&data, 6, code)
         LE.put32(&data, 8, tid)
-        data.replaceSubrange(12..<data.count, with: payload)
+        data.replaceSubrange((data.startIndex + 12)..<data.endIndex, with: payload)
         return data
     }
 
@@ -137,7 +150,7 @@ enum Packets {
     }
 
     static func payload(_ data: Data) -> Data {
-        data.count > 12 ? data.subdata(in: 12..<data.count) : Data()
+        data.count > 12 ? data.subdata(in: (data.startIndex + 12)..<data.endIndex) : Data()
     }
 }
 
@@ -160,13 +173,26 @@ enum Catalog {
     ]
 }
 
-enum LinkError: Error {
+enum LinkError: Error, CustomStringConvertible {
     case stalled
     case shortRead
     case closed
-    case timeout
+    case timeout(String)
     case rejected
+    case badLength(Int)
     case response(UInt16)
+
+    var description: String {
+        switch self {
+        case .stalled: return "Socket stalled"
+        case .shortRead: return "Short read"
+        case .closed: return "Socket closed by the body"
+        case .timeout(let what): return "Timed out \(what)"
+        case .rejected: return "Rejected"
+        case .badLength(let length): return "Bad packet length \(length)"
+        case .response(let rc): return String(format: "Response 0x%04x", rc)
+        }
+    }
 }
 
 protocol ByteLink: AnyObject, Sendable {
@@ -174,6 +200,12 @@ protocol ByteLink: AnyObject, Sendable {
     func write(_ data: Data) async throws
     func read(count: Int) async throws -> Data
     func close() async
+    /// Socket-level events (state changes, path, timeouts) for the trace.
+    func observe(_ sink: @escaping @Sendable (String, String) -> Void)
+}
+
+extension ByteLink {
+    func observe(_ sink: @escaping @Sendable (String, String) -> Void) {}
 }
 
 /// Packed `PtpFujiEvents`: u16 count, then {u16 code, u32 value}. DF00 is not always first.
@@ -235,6 +267,35 @@ enum ObjectInfo {
         return data
     }
 
+    /// USB PTP ObjectInfo: ObjectFormat u16 at 4, 0x3001 is an association (a folder such as DCIM/100_FUJI).
+    static func isFolder(_ data: Data) -> Bool {
+        data.count >= 6 && LE.u16(data, 4) == 0x3001
+    }
+
+    /// USB PTP ObjectInfo: ObjectCompressedSize is the aligned u32 at offset 8. Measured on an X100VI.
+    static func standardSize(_ data: Data) -> Int? {
+        guard data.count >= 12 else { return nil }
+        return Int(LE.u32(data, 8))
+    }
+
+    /// The PTP string after the filename: capture date, "20260924T195324" on an X100VI over USB.
+    static func captureDate(_ data: Data) -> String? {
+        let data = data.startIndex == 0 ? data : data.subdata(in: data.startIndex..<data.endIndex)
+        guard data.count > nameOffset else { return nil }
+        let skip = 1 + Int(data[nameOffset]) * 2
+        let offset = nameOffset + skip
+        guard offset < data.count else { return nil }
+        let count = Int(data[offset])
+        var units: [UInt16] = []
+        var cursor = offset + 1
+        for _ in 0..<count where cursor + 1 < data.count {
+            units.append(LE.u16(data, cursor))
+            cursor += 2
+        }
+        let text = String(decoding: units.filter { $0 != 0 }, as: UTF16.self)
+        return text.count >= 15 && text.first?.isNumber == true ? text : nil
+    }
+
     static func compressedSize(_ data: Data) -> Int? {
         guard data.count >= sizeOffset + 4 else { return nil }
         return Int(LE.u32(data, sizeOffset))
@@ -242,6 +303,7 @@ enum ObjectInfo {
 
     /// libfuji copies 52 fixed bytes, then `ptp_read_string` for the name.
     static func filename(_ data: Data) -> String? {
+        let data = data.startIndex == 0 ? data : data.subdata(in: data.startIndex..<data.endIndex)
         guard data.count > nameOffset else { return nil }
         let length = Int(data[nameOffset])
         if length == 0 { return nil }
@@ -273,5 +335,73 @@ enum ObjectInfo {
         if cursor + 2 <= data.count {
             LE.put16(&data, cursor, 0)
         }
+    }
+}
+
+/// PTP DeviceInfo, only as far as the trace needs: maker, model, firmware.
+enum DeviceDescription {
+    static func parse(_ data: Data) -> String {
+        let data = data.startIndex == 0 ? data : data.subdata(in: data.startIndex..<data.endIndex)
+        var offset = 8
+        func string() -> String {
+            guard offset < data.count else { return "" }
+            let count = Int(data[offset])
+            offset += 1
+            var units: [UInt16] = []
+            for _ in 0..<count where offset + 1 < data.count {
+                units.append(LE.u16(data, offset))
+                offset += 2
+            }
+            return String(decoding: units.filter { $0 != 0 }, as: UTF16.self)
+        }
+        func skipArray(_ width: Int) {
+            guard offset + 4 <= data.count else { offset = data.count; return }
+            offset += 4 + Int(LE.u32(data, offset)) * width
+        }
+        _ = string()
+        offset += 2
+        for _ in 0..<5 { skipArray(2) }
+        let maker = string(), model = string(), version = string()
+        return [maker, model, version.isEmpty ? "" : "firmware \(version)"].filter { !$0.isEmpty }.joined(separator: " ")
+    }
+}
+
+/// Just enough EXIF to turn a thumbnail the right way up.
+enum Exif {
+    /// Orientation (tag 0x0112) from the start of a JPEG: SOI, APP1 "Exif", TIFF header, IFD0.
+    static func orientation(_ jpeg: Data) -> Int? {
+        let d = [UInt8](jpeg)
+        guard d.count > 20, d[0] == 0xff, d[1] == 0xd8 else { return nil }
+        var i = 2
+        while i + 4 < d.count, d[i] == 0xff {
+            let marker = d[i + 1]
+            let length = Int(d[i + 2]) << 8 | Int(d[i + 3])
+            if marker == 0xe1, i + 10 < d.count, d[(i + 4)..<(i + 10)].elementsEqual([0x45, 0x78, 0x69, 0x66, 0, 0]) {
+                return tiff(d, base: i + 10)
+            }
+            if marker == 0xda { return nil }
+            i += 2 + length
+        }
+        return nil
+    }
+
+    private static func tiff(_ d: [UInt8], base: Int) -> Int? {
+        guard base + 8 <= d.count else { return nil }
+        let little = d[base] == 0x49
+        func u16(_ at: Int) -> Int? {
+            guard at + 1 < d.count else { return nil }
+            return little ? Int(d[at]) | Int(d[at + 1]) << 8 : Int(d[at]) << 8 | Int(d[at + 1])
+        }
+        func u32(_ at: Int) -> Int? {
+            guard let a = u16(at), let b = u16(at + 2) else { return nil }
+            return little ? a | b << 16 : a << 16 | b
+        }
+        guard let ifd = u32(base + 4), let count = u16(base + ifd) else { return nil }
+        for entry in 0..<count {
+            let at = base + ifd + 2 + entry * 12
+            guard let tag = u16(at) else { return nil }
+            if tag == 0x0112, let value = u16(at + 8), (1...8).contains(value) { return value }
+        }
+        return nil
     }
 }
