@@ -481,6 +481,9 @@ struct HomeView: View {
                 p.bytesPerSecond > 0 ? String(format: "%.1f MB/s", p.bytesPerSecond / 1_048_576) : nil,
                 remaining(done).map { "\($0) left" },
             ].compactMap { $0 })
+            if model.rateHistory.count > 2 {
+                RateSparkline(values: model.rateHistory)
+            }
         }
         if model.joinByHand, let wifi = model.cameraWifi {
             JoinRow(wifi: wifi)
@@ -1723,7 +1726,23 @@ struct DiagnosticsView: View {
                         .foregroundStyle(Ink.ink2)
                 }
             }
+            bluetoothExperiment(model)
         }
+    }
+
+    /// A/B switch for the Bluetooth link during transfers. Each report notes which way the run went.
+    private func bluetoothExperiment(_ model: BenchModel) -> some View {
+        Toggle(isOn: Binding(get: { model.releaseBluetoothEarly }, set: { model.releaseBluetoothEarly = $0 })) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Release Bluetooth during transfers").font(Ink.side(.title)).foregroundStyle(Ink.ink)
+                Text("Drops the Bluetooth link once Wi-Fi is up. Can be faster where both share an antenna. Try an import each way and share both reports.")
+                    .font(Ink.side(.detail))
+                    .foregroundStyle(Ink.ink2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .tint(Ink.ink)
+        .disabled(model.busy)
     }
 
     // MARK: History
@@ -1915,6 +1934,33 @@ struct DiagnosticsView: View {
 }
 
 /// Icons for the stages of a run, joined by a line: done in green, the current one pulsing, the rest faint.
+/// MB/s each second of the running import, newest on the right. Dips show a stall as it happens.
+struct RateSparkline: View {
+    let values: [Double]
+
+    var body: some View {
+        let top = max(values.max() ?? 0, 0.1)
+        HStack(alignment: .center, spacing: 8) {
+            GeometryReader { geo in
+                Path { path in
+                    let step = geo.size.width / CGFloat(max(values.count - 1, 1))
+                    for (i, v) in values.enumerated() {
+                        let point = CGPoint(x: CGFloat(i) * step, y: geo.size.height * (1 - CGFloat(v / top)))
+                        if i == 0 { path.move(to: point) } else { path.addLine(to: point) }
+                    }
+                }
+                .stroke(Ink.ink2, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+            }
+            .frame(height: 22)
+            Text(String(format: "peak %.1f", top))
+                .font(Ink.side(.detail))
+                .monospacedDigit()
+                .foregroundStyle(Ink.muted)
+        }
+        .accessibilityLabel(String(format: "Speed over the last %d seconds, peak %.1f MB/s", values.count, top))
+    }
+}
+
 struct StepRail: View {
     let steps: [String]
     let current: Int

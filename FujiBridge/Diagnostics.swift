@@ -475,12 +475,28 @@ enum Diagnostics {
         // Waiting for OK or for ImageCaptureCore's index is expected silence, already reported on its own.
         let waiting = lines.contains { $0.title == "Catalog complete" || $0.title == "Catalog ready" || $0.title == "Catalog still loading" }
         let catalogEnd = lines.first { $0.title.hasPrefix("Catalog") && $0.title != "Catalog so far" }?.ms ?? 0
-        let gaps = zip(lines, lines.dropFirst()).filter { before, after in
+        // The app's own 5 s samples would fill every silence; they are not traffic.
+        let traffic = lines.filter { $0.op != "sample" }
+        let gaps = zip(traffic, traffic.dropFirst()).filter { before, after in
             after.ms - before.ms > 2000 && !after.op.hasPrefix("ok-wait") && !before.op.hasPrefix("ok-wait")
                 && !(waiting && after.ms <= catalogEnd)
         }
         for (before, after) in gaps.prefix(5) {
             add("warn", "Silent for \(ms(after.ms - before.ms))", "Between \"\(before.title)\" at \(ms(before.ms)) and \"\(after.title)\" at \(ms(after.ms)).")
+        }
+        let samples = lines.filter { $0.op == "sample" }
+        if let hot = samples.first(where: { $0.detail.contains("thermal serious") || $0.detail.contains("thermal critical") }) {
+            add("warn", "Phone running hot at \(ms(hot.ms))", "iOS throttles the radio and the CPU when hot. \(hot.detail)")
+        }
+        if let low = samples.first(where: { $0.detail.contains("Low Power") }) {
+            add("info", "Low Power Mode was on", "It can slow Wi-Fi. \(low.detail)")
+        }
+        if let battery = lines.first(where: { $0.title == "Camera battery" }) {
+            add("info", "Camera battery", battery.detail)
+        }
+        if let ble = lines.first(where: { $0.title == "Bluetooth released" || ($0.title == "Bluetooth kept" && $0.op == "ble" && $0.detail.hasPrefix("The link stays open during")) }) {
+            add("info", ble.title == "Bluetooth released" ? "Bluetooth off during the transfer" : "Bluetooth on during the transfer",
+                "Compare runs with the setting in Diagnostics on and off: if Bluetooth shares the antenna, the off runs move faster.")
         }
         for line in lines where line.op == "app" && line.level != "info" {
             add("warn", line.title + " at \(ms(line.ms))", line.detail)

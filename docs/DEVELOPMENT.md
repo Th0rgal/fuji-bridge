@@ -27,6 +27,8 @@ Fuji Bridge, compared with the way that session usually dies:
 - **Leaving the screen.** iOS will not join a network for a background app. The join waits for the app to come back, and an import cut short by leaving the screen starts again (as a resume) when it does, within 10 minutes.
 - **Per window.** Every GetPartialObject line records the first-byte latency (the camera) and, over TCP, how many receives the window came in and the longest silence once bytes were flowing (the radio).
 - **TRANSFER** in the report: wire vs effective MB/s, per-window p10/p50/p90, first byte and silence percentiles, reconnects and their cost, bytes asked twice, bytes resumed from disk, and MB/s per 5 s slice. The same numbers are in the JSON (`transfer`).
+- **Samples.** Every 5 s the trace gets a `sample` line: MB/s over those 5 s, phone battery, thermal state, Low Power Mode, on screen or not, and the phase. The import card draws the same speed live, one point a second. The camera's own BatteryLevel (PTP `0x5001`) is read once after the handshake.
+- **Bluetooth during transfers** (Diagnostics switch, off by default): drop the Bluetooth link once the Wi-Fi session is open. Each report says which way the run went, so an import with and without it can be compared on the same phone.
 - **Speed test** (Diagnostics): reads the newest photo with 256 KB, 512 KB, 1 MB, 2 MB and 4 MB windows, up to 8 MB each, saves nothing, and switches imports to the fastest window if it beats the current one by 10%. "Back to 1 MB" undoes it.
 
 ## Two modes

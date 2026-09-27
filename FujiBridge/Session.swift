@@ -159,6 +159,8 @@ struct RunOptions: Sendable {
     var rejoin: (@Sendable () async -> Bool)? = nil
     /// Speed test instead of an import: read the newest frame once per window size, save nothing.
     var benchmark: [Int]? = nil
+    /// Called once the Wi-Fi session is open, before the card is read. The app may let go of Bluetooth here.
+    var sessionUp: (@Sendable () -> Void)? = nil
 }
 
 enum Importer {
@@ -202,6 +204,12 @@ enum Importer {
         } else {
             let handshake = await wifiHandshake(io, link: link, options: options, files: files)
             if let handshake { return handshake }
+            // Standard PTP BatteryLevel. A body low on charge may throttle its radio; the report should say so.
+            if options.live, let level = try? await io.getProp(Fuji.batteryLevel, title: "Get 0x5001", op: "setup"), !level.isEmpty {
+                let value = level.count >= 2 ? Int(LE.u16(level, 0)) : Int(level[level.startIndex])
+                io.note("Camera battery", "BatteryLevel reads \(value) (raw \(Packets.hex(level))).", op: "setup")
+            }
+            options.sessionUp?()
         }
 
         var queue = selected

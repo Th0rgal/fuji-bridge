@@ -37,6 +37,8 @@ enum Fuji {
     static let getFolders: UInt16 = 0x9050
     static let getDates: UInt16 = 0x9053
 
+    /// Standard PTP BatteryLevel.
+    static let batteryLevel: UInt32 = 0x5001
     static let cameraState: UInt32 = 0xdf00
     static let clientState: UInt32 = 0xdf01
     static let events: UInt32 = 0xd212

@@ -139,6 +139,15 @@ final class BenchModel {
     private var session: SessionLog?
     private var background: UIBackgroundTaskIdentifier = .invalid
     private var pathWatch: PathWatch?
+    /// Samples the phone and the speed once a second while a run is on.
+    private var sampler: Task<Void, Never>?
+    /// MB/s over the last two minutes of the run, one value a second, for the live graph.
+    var rateHistory: [Double] = []
+    /// Experiment: drop the Bluetooth link once the Wi-Fi session is open. On phones where Bluetooth and
+    /// 2.4 GHz Wi-Fi share an antenna this may speed the transfer up; reports say which way each run went.
+    var releaseBluetoothEarly: Bool = UserDefaults.standard.bool(forKey: "BridgeReleaseBLE") {
+        didSet { UserDefaults.standard.set(releaseBluetoothEarly, forKey: "BridgeReleaseBLE") }
+    }
     private var memoryObserver: NSObjectProtocol?
     /// Idle sleep would drop the Wi-Fi mid-file. The idle timer covers the phone's screen; this covers the Mac.
     private var activity: NSObjectProtocol?
@@ -422,6 +431,15 @@ final class BenchModel {
                     rejoin = { [weak self] in await self?.rejoinCamera(session) ?? false }
                 }
                 let benchmark: [Int]? = purpose == .speedTest ? Self.benchWindows : nil
+                let releaseEarly = releaseBluetoothEarly
+                let sessionUp: @Sendable () -> Void = {
+                    if releaseEarly {
+                        FujiBluetooth.shared.release()
+                        session.event("Bluetooth released", "Dropped once the Wi-Fi session was open (Diagnostics › Release Bluetooth during transfers).", op: "ble")
+                    } else {
+                        session.event("Bluetooth kept", "The link stays open during the transfer.", op: "ble")
+                    }
+                }
                 result = await Importer.run(
                     link: link,
                     options: RunOptions(
@@ -446,7 +464,8 @@ final class BenchModel {
                         size: size,
                         window: window,
                         rejoin: rejoin,
-                        benchmark: benchmark
+                        benchmark: benchmark,
+                        sessionUp: sessionUp
                     ),
                     log: log
                 )
@@ -725,11 +744,66 @@ final class BenchModel {
         ) { _ in
             session.event("Memory warning", "iOS asked Fuji Bridge to free memory. Files stream to disk, so this comes from elsewhere (thumbnails, the viewer).", level: "warn")
         }
+        startSampler(session)
         let env = DeviceInfo.snapshot(path: "pending")
         session.event("Session", "\(env.platform), \(env.device), \(env.system), app \(env.app) (\(env.build)), thermal \(env.thermal)\(env.lowPower ? ", Low Power Mode" : "").")
     }
 
+    /// Once a second: the transfer speed, for the live graph. Every 5 s, a "sample" line in the trace with the
+    /// speed and the phone's state (battery, heat, Low Power Mode, on screen or not), so a slow patch in a
+    /// report can be matched with what the phone was doing.
+    private func startSampler(_ session: SessionLog) {
+        sampler?.cancel()
+        rateHistory = []
+        UIDevice.current.isBatteryMonitoringEnabled = true
+        sampler = Task { @MainActor [weak self] in
+            var last = 0
+            var window: [Double] = []
+            var tick = 0
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard let self, !Task.isCancelled else { return }
+                let copied = self.progress?.copiedBytes ?? last
+                let rate = Double(max(0, copied - last)) / 1_048_576
+                last = copied
+                if self.progress != nil {
+                    self.rateHistory.append(rate)
+                    if self.rateHistory.count > 120 { self.rateHistory.removeFirst(self.rateHistory.count - 120) }
+                }
+                window.append(rate)
+                tick += 1
+                guard tick % 5 == 0 else { continue }
+                let average = window.reduce(0, +) / Double(max(1, window.count))
+                window = []
+                session.event("Sample", Self.sampleText(rate: average, phase: self.phase), op: "sample")
+            }
+        }
+    }
+
+    private static func sampleText(rate: Double, phase: String) -> String {
+        let device = UIDevice.current
+        let battery = device.batteryLevel >= 0 ? "\(Int(device.batteryLevel * 100))%" + (device.batteryState == .charging || device.batteryState == .full ? " charging" : "") : "n/a"
+        let thermal: String
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal: thermal = "nominal"
+        case .fair: thermal = "fair"
+        case .serious: thermal = "serious"
+        case .critical: thermal = "critical"
+        @unknown default: thermal = "?"
+        }
+        let state: String
+        switch UIApplication.shared.applicationState {
+        case .active: state = "on screen"
+        case .inactive: state = "inactive"
+        case .background: state = "background"
+        @unknown default: state = "?"
+        }
+        return String(format: "%.2f MB/s", rate) + " · battery \(battery) · thermal \(thermal)\(ProcessInfo.processInfo.isLowPowerModeEnabled ? " · Low Power" : "") · \(state) · \(phase)"
+    }
+
     private func finish(_ session: SessionLog, mode: String, host: String, result: RunResult) {
+        sampler?.cancel()
+        sampler = nil
         let environment = DeviceInfo.snapshot(path: pathWatch?.current ?? "unknown")
         pathWatch?.stop()
         pathWatch = nil
