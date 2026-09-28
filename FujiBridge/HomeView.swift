@@ -281,23 +281,36 @@ struct HomeView: View {
                 .foregroundStyle(Ink.ink2)
                 .help("Stop")
                 .accessibilityLabel("Stop")
+            } else if model.connected {
+                Button { model.disconnect() } label: {
+                    Label("Disconnect", systemImage: "wifi.slash")
+                        .labelStyle(.iconOnly)
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(width: 30, height: 30)
+                        .background(Ink.surface2, in: Circle())
+                }
+                .buttonStyle(InkPress())
+                .foregroundStyle(Ink.ink2)
+                .help("Disconnect from the camera")
             }
         }
     }
 
     private var linkLabel: String {
         if model.usbCamera != nil { return "USB" }
+        if model.connected { return "Connected · Wi-Fi" }
         if model.bluetoothCamera != nil { return model.bluetoothPairedHere ? "Bluetooth · paired" : "Bluetooth" }
         return model.bluetoothEnabled ? "Listening" : "Wi-Fi · \(model.host)"
     }
 
     private var linkSymbol: String {
         if model.usbCamera != nil { return "bolt.horizontal" }
+        if model.connected { return "wifi" }
         if model.bluetoothCamera != nil || model.bluetoothEnabled { return "dot.radiowaves.left.and.right" }
         return "wifi"
     }
 
-    private var connected: Bool { model.usbCamera != nil || model.bluetoothCamera != nil }
+    private var connected: Bool { model.usbCamera != nil || model.bluetoothCamera != nil || model.connected }
 
     private var cameraIcon: String {
         if model.usbCamera != nil { return "cable.connector" }
@@ -2004,30 +2017,69 @@ struct BreathingRing: View {
     }
 }
 
-/// MB/s each second of the running import, newest on the right. Dips show a stall as it happens.
+/// MB/s over the last minute of the running import, newest on the right: a smoothed curve over a soft fill,
+/// the latest value marked. The number itself is already on the line above, so the graph carries no text.
 struct RateSparkline: View {
     let values: [Double]
+    /// Seconds shown; the curve scrolls left as the import goes on.
+    private let span = 60
 
     var body: some View {
-        let top = max(values.max() ?? 0, 0.1)
-        HStack(alignment: .center, spacing: 8) {
-            GeometryReader { geo in
-                Path { path in
-                    let step = geo.size.width / CGFloat(max(values.count - 1, 1))
-                    for (i, v) in values.enumerated() {
-                        let point = CGPoint(x: CGFloat(i) * step, y: geo.size.height * (1 - CGFloat(v / top)))
-                        if i == 0 { path.move(to: point) } else { path.addLine(to: point) }
-                    }
-                }
-                .stroke(Ink.ink2, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+        // The seconds before the first bytes (connect, ObjectInfo) are not speed; start at the first real value.
+        let flowing = Array(values.drop { $0 == 0 }.suffix(span))
+        let points = Self.smoothed(flowing)
+        let top = max((points.max() ?? 0) * 1.15, 0.1)
+        // Fills the width from the start, then scrolls once a minute has passed.
+        let slots = min(max(points.count, 10), span)
+        GeometryReader { geo in
+            let step = geo.size.width / CGFloat(slots - 1)
+            let origin = geo.size.width - CGFloat(points.count - 1) * step
+            let xy = points.enumerated().map { i, v in
+                CGPoint(x: origin + CGFloat(i) * step, y: geo.size.height * (1 - CGFloat(v / top)))
             }
-            .frame(height: 22)
-            Text(String(format: "peak %.1f", top))
-                .font(Ink.side(.detail))
-                .monospacedDigit()
-                .foregroundStyle(Ink.muted)
+            ZStack(alignment: .topLeading) {
+                Self.curve(xy, closeTo: geo.size.height)
+                    .fill(LinearGradient(colors: [Ink.ink2.opacity(0.18), Ink.ink2.opacity(0)], startPoint: .top, endPoint: .bottom))
+                Self.curve(xy, closeTo: nil)
+                    .stroke(Ink.ink2, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+                if let last = xy.last {
+                    Circle()
+                        .fill(Ink.ink)
+                        .frame(width: 5, height: 5)
+                        .position(last)
+                }
+            }
         }
-        .accessibilityLabel(String(format: "Speed over the last %d seconds, peak %.1f MB/s", values.count, top))
+        .frame(height: 26)
+        .animation(.linear(duration: 0.9), value: values.count)
+        .opacity(points.count > 1 ? 1 : 0)
+        .accessibilityLabel(String(format: "Speed over the last %d seconds, up to %.1f MB/s", min(values.count, span), values.suffix(span).max() ?? 0))
+    }
+
+    /// A three-second moving average: the pauses between files stop reading as crashes.
+    static func smoothed(_ values: [Double]) -> [Double] {
+        values.indices.map { i in
+            let window = values[max(0, i - 2)...i]
+            return window.reduce(0, +) / Double(window.count)
+        }
+    }
+
+    /// Through the midpoints with quadratic curves: smooth, and it never overshoots below zero.
+    static func curve(_ points: [CGPoint], closeTo bottom: CGFloat?) -> Path {
+        Path { path in
+            guard let first = points.first else { return }
+            path.move(to: first)
+            for (a, b) in zip(points, points.dropFirst()) {
+                let mid = CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2)
+                path.addQuadCurve(to: mid, control: a)
+            }
+            if let last = points.last { path.addLine(to: last) }
+            if let bottom, let last = points.last {
+                path.addLine(to: CGPoint(x: last.x, y: bottom))
+                path.addLine(to: CGPoint(x: first.x, y: bottom))
+                path.closeSubpath()
+            }
+        }
     }
 }
 

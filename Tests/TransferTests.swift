@@ -134,3 +134,52 @@ extension Data {
         return data
     }
 }
+
+/// The Wi-Fi session kept open between actions: browse, then import, without a second handshake.
+final class KeptSessionTests: XCTestCase {
+    func testASecondRunReusesTheSessionWithoutAHandshake() async throws {
+        let frames = Array(Catalog.roll.prefix(2))
+        let control = RunControl()
+        control.ok = true
+        let body = VirtualBody(faults: .none, control: control, frames: frames)
+        let link = VirtualLink(body: body)
+        var first: [TraceLine] = []
+        let listed = await Importer.session(
+            link: link,
+            options: RunOptions(kind: .bridge, frames: frames, faults: .none, control: control, preview: { _ in }, keepOpen: true),
+            log: { first.append($0) }
+        )
+        XCTAssertTrue(listed.result.ok, listed.result.summary)
+        let live = try XCTUnwrap(listed.live)
+        XCTAssertEqual(body.openTids, [1])
+        let alive = await Importer.probe(live)
+        XCTAssertTrue(alive)
+
+        var second: [TraceLine] = []
+        let imported = await Importer.session(
+            link: live.link,
+            options: RunOptions(kind: .bridge, frames: [frames[1]], faults: .none, control: control, keepOpen: true, reuse: live),
+            log: { second.append($0) }
+        )
+        XCTAssertTrue(imported.result.ok, imported.result.summary)
+        XCTAssertEqual(imported.result.files.map(\.state), ["full"])
+        // No second OpenSession, no init: the first line of the new run says the session was reused.
+        XCTAssertEqual(body.openTids, [1])
+        XCTAssertTrue(second.contains { $0.title == "Session reused" })
+        XCTAssertFalse(second.contains { $0.op == "init" })
+        XCTAssertNotNil(imported.live)
+    }
+
+    func testAFailedRunDoesNotKeepTheSession() async {
+        let control = RunControl()
+        control.ok = true
+        let body = VirtualBody(faults: .none, control: control, frames: [])
+        let outcome = await Importer.session(
+            link: VirtualLink(body: body),
+            options: RunOptions(kind: .bridge, frames: [Catalog.roll[0]], faults: .none, control: control, keepOpen: true),
+            log: { _ in }
+        )
+        XCTAssertFalse(outcome.result.ok)
+        XCTAssertNil(outcome.live)
+    }
+}

@@ -161,18 +161,62 @@ struct RunOptions: Sendable {
     var benchmark: [Int]? = nil
     /// Called once the Wi-Fi session is open, before the card is read. The app may let go of Bluetooth here.
     var sessionUp: (@Sendable () -> Void)? = nil
+    /// Leave the session open when the run ends well, for `Importer.session` to hand back.
+    var keepOpen: Bool = false
+    /// A session an earlier run kept: reuse it instead of connecting.
+    var reuse: LiveSession? = nil
 }
 
 enum Importer {
     static func run(link: ByteLink, options: RunOptions, log: @escaping (TraceLine) -> Void) async -> RunResult {
-        let io = IO(link: link, log: log, origin: options.clockOrigin)
+        await session(link: link, options: options, log: log).result
+    }
+
+    /// A run that may leave its Wi-Fi session open for the next one (`keepOpen`), or pick up the one the last
+    /// run left (`reuse`): no Bluetooth wake, no join, no init or OpenSession, just the next command.
+    /// The session comes back only when the run ended well; otherwise the socket is closed.
+    static func session(link: ByteLink, options: RunOptions, log: @escaping (TraceLine) -> Void) async -> (result: RunResult, live: LiveSession?) {
+        let io: IO
+        if let reuse = options.reuse {
+            io = reuse.io
+            io.rebind(log: log, origin: options.clockOrigin)
+        } else {
+            io = IO(link: link, log: log, origin: options.clockOrigin)
+        }
+        io.keepOpen = options.keepOpen
+        // Per-run state: this run decides again whether it resizes and whether D227 is needed.
+        io.resizeRate = nil
+        io.realSizeInfo = false
+        io.file = ""
+        let result = await perform(link: link, options: options, io: io)
+        guard options.keepOpen else { return (result, nil) }
+        if result.ok && result.reason != "still-waiting" {
+            io.note("Session kept", "The Wi-Fi session stays open for the next action.", op: "done")
+            return (result, LiveSession(link: link, io: io, host: options.host))
+        }
+        await link.close()
+        return (result, nil)
+    }
+
+    /// Is a kept session still answering? One event poll with a short deadline.
+    static func probe(_ live: LiveSession) async -> Bool {
+        live.link.setReadTimeout(4)
+        defer { live.link.setReadTimeout(30) }
+        do {
+            _ = try await live.io.cameraState()
+            return true
+        } catch {
+            await live.link.close()
+            return false
+        }
+    }
+
+    private static func perform(link: ByteLink, options: RunOptions, io: IO) async -> RunResult {
         io.transport = options.transport
         let usb = options.transport == .usb
         let wire = usb ? "USB" : "TCP \(options.host):\(Fuji.port)"
-        let kind = options.kind
-        let faults = options.faults
         let selected = options.frames
-        var files = selected.map {
+        let files = selected.map {
             FileResult(handle: $0.handle, name: $0.name, got: 0, total: $0.bytes, state: "lost")
         }
         guard !selected.isEmpty || options.live else {
@@ -183,6 +227,17 @@ enum Importer {
         }
 
         link.observe { title, detail in io.note(title, detail, op: "net") }
+        if options.reuse != nil {
+            io.ok("Session reused", "Still open from the last action: no wake, no join, no handshake.", op: "connect", took: 0)
+            let refreshStart = io.now()
+            _ = try? await io.cameraState()
+            _ = try? await io.getProp(Fuji.importCount, title: "Get D620", op: "setup")
+            if let handles = try? await io.getProp(Fuji.importHandles, title: "Get D621 handles", op: "setup") {
+                io.importHandles = FujiArray.handles(handles)
+            }
+            io.ok("Card list refreshed", "\(io.importHandles.count) handles in D621, D222 = \(io.objectCount).", op: "setup-total", took: io.now() - refreshStart)
+            return await afterHandshake(link: link, options: options, io: io, files: files)
+        }
         let connectStart = io.now()
         do {
             try await link.open()
@@ -211,7 +266,14 @@ enum Importer {
             }
             options.sessionUp?()
         }
+        return await afterHandshake(link: link, options: options, io: io, files: files)
+    }
 
+    /// From an open session on: list the card, then copy, list, delete or test.
+    private static func afterHandshake(link: ByteLink, options: RunOptions, io: IO, files: [FileResult]) async -> RunResult {
+        var files = files
+        let usb = options.transport == .usb
+        let selected = options.frames
         var queue = selected
         if options.live {
             var handles = io.importHandles.isEmpty
@@ -323,7 +385,7 @@ enum Importer {
         if fujiProps {
             _ = try? await io.setProp(Fuji.compressSmall, value: LE.data16(0), title: "Set D226 = 0", op: "prep")
         }
-        await link.close()
+        await io.finish()
         let summary = "Speed test: " + results.joined(separator: " · ")
         io.ok("Speed test done", summary, op: "done", took: io.now())
         files = files.map { var f = $0; f.state = f.handle == frame.handle ? "tested" : "skipped"; return f }
@@ -380,7 +442,7 @@ enum Importer {
                 return RunResult(ok: false, reason: "link", summary: "Deleted \(done) of \(queue.count), then the link failed. \(IO.describe(error))", files: files)
             }
         }
-        await link.close()
+        await io.finish()
         let done = files.filter { $0.state == "deleted" }.count
         if refusals.isEmpty {
             return RunResult(ok: true, reason: "deleted", summary: "Deleted \(done) from the camera.", files: files)
@@ -864,7 +926,7 @@ enum Importer {
                 _ = try? await io.setProp(Fuji.correctSize, value: LE.data16(0), title: "Set D227 = 0", op: "prep")
             }
         }
-        await link.close()
+        await io.finish()
         if options.preview != nil {
             let listed = files.filter { $0.state == "previewed" }.count
             let summary = "\(listed) photo\(listed == 1 ? "" : "s") on the camera."
@@ -962,7 +1024,7 @@ enum Importer {
     }
 }
 
-private struct Exchange {
+struct Exchange {
     var payload: Data
     var completed: Bool
     var response: UInt16
@@ -970,9 +1032,25 @@ private struct Exchange {
     var bytes: Int { payload.count }
 }
 
-private final class IO: @unchecked Sendable {
+/// A Wi-Fi session left open by one run for the next: the socket and the session's own state (transaction id…).
+final class LiveSession: @unchecked Sendable {
     let link: ByteLink
-    let log: (TraceLine) -> Void
+    let io: IO
+    let host: String
+    let since = Date()
+
+    init(link: ByteLink, io: IO, host: String) {
+        self.link = link
+        self.io = io
+        self.host = host
+    }
+}
+
+final class IO: @unchecked Sendable {
+    let link: ByteLink
+    private(set) var log: (TraceLine) -> Void
+    /// Leave the socket open when the run ends well (a kept session).
+    var keepOpen = false
     var tid: UInt32 = 1
     var objectCount = 0
     /// D227 is on: the body did not answer ObjectSize, or it is resizing.
@@ -984,7 +1062,7 @@ private final class IO: @unchecked Sendable {
     var transport: Transport = .wifi
     /// Frame the next lines belong to.
     var file = ""
-    private let origin: UInt64
+    private var origin: UInt64
     private let lock = NSLock()
     private var seq = 1
     /// When the length word of the last packet arrived. Partial reads use it for time to first byte.
@@ -998,6 +1076,19 @@ private final class IO: @unchecked Sendable {
 
     func now() -> Double {
         Double(DispatchTime.now().uptimeNanoseconds - origin) / 1_000_000
+    }
+
+    /// A kept session starts a new run: its lines go to the new trace, on the new clock.
+    func rebind(log: @escaping (TraceLine) -> Void, origin: UInt64?) {
+        lock.lock()
+        self.log = log
+        self.origin = origin ?? DispatchTime.now().uptimeNanoseconds
+        lock.unlock()
+    }
+
+    /// End of a run that went well: keep the socket if the session is kept.
+    func finish() async {
+        if !keepOpen { await link.close() }
     }
 
     func note(_ title: String, _ detail: String, op: String = "", took: Double? = nil, bytes: Int = 0, data: Data = Data()) {

@@ -194,6 +194,13 @@ final class BenchModel {
                 case "virtual": self.start(.bridge, mode: .virtual)
                 case "wifi": self.importFromCamera(over: .wifi)
                 case "browse": self.browse()
+                case "browse-import":
+                    // Connect, then pick the two newest and import them over the same kept session.
+                    self.browse()
+                    while self.busy || self.cameraPhotos.isEmpty { try? await Task.sleep(nanoseconds: 200_000_000) }
+                    try? await Task.sleep(nanoseconds: 3_000_000_000)
+                    self.selection = Set(self.cameraPhotos.prefix(2).map(\.handle))
+                    self.importFromCamera()
                 case "viewer":
                     self.refreshSaved()
                     let index = min(UserDefaults.standard.integer(forKey: "BridgeViewerIndex"), max(self.saved.count - 1, 0))
@@ -408,13 +415,15 @@ final class BenchModel {
                 self.bleError = nil
                 self.stopHint = nil
                 self.leftScreen = false
+                // The session the last action kept open: check it still answers, then skip wake, join and handshake.
+                let reuse = transport == .wifi ? await self.takeLiveSession(for: host, session) : nil
                 // Bluetooth on: look for the body even if it has not been heard yet (it may have just woken up).
-                if transport == .wifi && self.bluetoothEnabled {
+                if reuse == nil && transport == .wifi && self.bluetoothEnabled {
                     connectTimeout = await self.wakeAndJoin(session)
                 }
                 // After a Bluetooth wake the body can take its time to answer the first packet.
                 // Three init attempts of 12 s each beat one of 30 s: a silent socket gets replaced (Session.swift).
-                let tcp = transport == .wifi ? TCPLink(host: host, connectTimeout: connectTimeout, readTimeout: connectTimeout > 8 ? 12 : 10) : nil
+                let tcp = transport == .wifi ? ((reuse?.link as? TCPLink) ?? TCPLink(host: host, connectTimeout: connectTimeout, readTimeout: connectTimeout > 8 ? 12 : 10)) : nil
                 let link: ByteLink = tcp ?? USBLink()
                 let opening: Bool
                 if case .open = purpose { opening = true } else { opening = false }
@@ -442,7 +451,7 @@ final class BenchModel {
                         session.event("Bluetooth kept", "The link stays open during the transfer.", op: "ble")
                     }
                 }
-                result = await Importer.run(
+                let outcome = await Importer.session(
                     link: link,
                     options: RunOptions(
                         kind: .bridge,
@@ -467,11 +476,19 @@ final class BenchModel {
                         window: window,
                         rejoin: rejoin,
                         benchmark: benchmark,
-                        sessionUp: sessionUp
+                        sessionUp: sessionUp,
+                        keepOpen: transport == .wifi,
+                        reuse: reuse
                     ),
                     log: log
                 )
-                FujiBluetooth.shared.release()
+                result = outcome.result
+                if let live = outcome.live {
+                    // Bluetooth stays up with the session: the body may tie its access point to it.
+                    self.keep(live)
+                } else {
+                    FujiBluetooth.shared.release()
+                }
                 if tcp == nil {
                     let usb = USBCameras.shared
                     session.event("ImageCaptureCore totals", String(format: "%d commands, %.0f ms inside ImageCaptureCore, %.0f ms in the hop back.", usb.commands, usb.iccMs, usb.hopMs), op: "net")
@@ -604,6 +621,72 @@ final class BenchModel {
         }
         phase = "Joining \(ssid)"
         #endif
+    }
+
+    /// The Wi-Fi session the last action left open, so the next one starts at once.
+    private(set) var liveSession: LiveSession?
+    var connected: Bool { liveSession != nil }
+    @ObservationIgnored private var keepAlive: Task<Void, Never>?
+    @ObservationIgnored private var probing: Task<Bool, Never>?
+    @ObservationIgnored private var lastUse = Date()
+
+    /// Holds a kept session: pings the body every 15 s while idle, lets go after 10 idle minutes.
+    private func keep(_ live: LiveSession) {
+        liveSession = live
+        lastUse = Date()
+        keepAlive?.cancel()
+        keepAlive = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                guard let self, !Task.isCancelled, let live = self.liveSession else { return }
+                if self.busy { continue }
+                if Date().timeIntervalSince(self.lastUse) > 600 {
+                    self.disconnect()
+                    return
+                }
+                let check = Task { await Importer.probe(live) }
+                self.probing = check
+                let alive = await check.value
+                self.probing = nil
+                if !alive, self.liveSession === live {
+                    self.liveSession = nil
+                    FujiBluetooth.shared.release()
+                    return
+                }
+            }
+        }
+    }
+
+    /// Hands the kept session to a run, if it still answers. Waits for a ping in flight first: two
+    /// commands on one socket at once would cross their answers.
+    private func takeLiveSession(for host: String, _ session: SessionLog) async -> LiveSession? {
+        if let check = probing { _ = await check.value }
+        guard let live = liveSession else { return nil }
+        liveSession = nil
+        keepAlive?.cancel()
+        guard live.host == host else {
+            await live.link.close()
+            return nil
+        }
+        let start = Date()
+        if await Importer.probe(live) {
+            lastUse = Date()
+            session.event("Kept session", "Open for \(Int(Date().timeIntervalSince(live.since))) s; it answered in \(Int(Date().timeIntervalSince(start) * 1000)) ms.", op: "net")
+            return live
+        }
+        session.event("Kept session gone", "The session left open by the last action no longer answers. Connecting again.", op: "net", level: "warn")
+        FujiBluetooth.shared.release()
+        return nil
+    }
+
+    /// Closes the kept session and lets go of Bluetooth.
+    func disconnect() {
+        keepAlive?.cancel()
+        keepAlive = nil
+        guard let live = liveSession else { return }
+        liveSession = nil
+        Task { await live.link.close() }
+        FujiBluetooth.shared.release()
     }
 
     /// Where the next thumbnail of the running listing goes in `cameraPhotos`.
