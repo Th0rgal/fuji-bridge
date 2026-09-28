@@ -146,6 +146,20 @@ final class VirtualBody: @unchecked Sendable {
             LE.put32(&size, 0, UInt32(served(frame.bytes)))
             return .bytes(Packets.dataPhase(code: code, tid: tid, payload: size)
                 + Packets.response(code: code, tid: tid))
+        case Fuji.getObjectPropValue where answersObjectProps && params.count > 1 && (params[1] == Fuji.objectFileName || params[1] == Fuji.dateCreated):
+            guard let frame = frames.first(where: { $0.handle == Int(params[0]) }) else {
+                return .bytes(Packets.response(code: code, tid: tid, rc: Fuji.invalidObject))
+            }
+            let value = PTPString.encode(params[1] == Fuji.objectFileName ? frame.name : "20260924T195324")
+            return .bytes(Packets.dataPhase(code: code, tid: tid, payload: value)
+                + Packets.response(code: code, tid: tid))
+        case Fuji.getThumb:
+            guard frames.contains(where: { $0.handle == Int(params.first ?? 0) }) else {
+                return .bytes(Packets.response(code: code, tid: tid, rc: Fuji.invalidObject))
+            }
+            // A tiny stand-in for the body's 160×120 JPEG.
+            return .bytes(Packets.dataPhase(code: code, tid: tid, payload: Data([0xff, 0xd8, 0, 0, 0xff, 0xd9]))
+                + Packets.response(code: code, tid: tid))
         case Fuji.getPartial:
             let handle = Int(params.first ?? 0)
             let offset = Int(params.count > 1 ? params[1] : 0)
@@ -164,6 +178,8 @@ final class VirtualBody: @unchecked Sendable {
     var shortWindow: Int?
     /// Test hook: a body without ObjectSize, so the importer has to fall back to D227.
     var answersObjectSize = true
+    /// Test hook: name and date by object property (0xDC07, 0xDC08), so the importer can skip GetObjectInfo.
+    var answersObjectProps = false
     /// Test hook, as an X100VI does: while resizing, ObjectInfo still gives the original's length.
     var announcesOriginalWhenResizing = false
 

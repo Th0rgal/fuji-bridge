@@ -24,6 +24,10 @@ enum Fuji {
     /// MTP GetObjectPropValue. XApp reads a file's size as ObjectSize (0xDC04) with it, instead of turning on D227.
     static let getObjectPropValue: UInt16 = 0x9803
     static let objectSize: UInt32 = 0xdc04
+    /// MTP ObjectFileName and DateCreated, asked with GetObjectPropValue like ObjectSize. On an X100VI
+    /// GetObjectInfo takes 500–700 ms per file (27 Sept report); a property answers in about 10 ms.
+    static let objectFileName: UInt32 = 0xdc07
+    static let dateCreated: UInt32 = 0xdc08
     /// What XApp asks instead of ObjectSize when the body compresses (resizes) the object.
     static let compressedObjectSize: UInt32 = 0xd802
     static let ok: UInt16 = 0x2001
@@ -59,6 +63,31 @@ enum Fuji {
     static let resizeRate: UInt32 = 0xd22e
     static let importCount: UInt32 = 0xd620
     static let importHandles: UInt32 = 0xd621
+}
+
+/// A PTP string: a count byte (characters, including the closing NUL), then UTF-16LE.
+enum PTPString {
+    static func decode(_ data: Data) -> String? {
+        let data = data.startIndex == 0 ? data : data.subdata(in: data.startIndex..<data.endIndex)
+        guard let count = data.first, count > 0 else { return nil }
+        var units: [UInt16] = []
+        var cursor = 1
+        for _ in 0..<Int(count) where cursor + 1 < data.count {
+            let unit = LE.u16(data, cursor)
+            cursor += 2
+            if unit == 0 { break }
+            units.append(unit)
+        }
+        let text = String(decoding: units, as: UTF16.self)
+        return text.isEmpty ? nil : text
+    }
+
+    static func encode(_ text: String) -> Data {
+        let units = Array(text.utf16)
+        var data = Data([UInt8(units.count + 1)])
+        for unit in units + [0] { data.append(contentsOf: [UInt8(unit & 0xff), UInt8(unit >> 8)]) }
+        return data
+    }
 }
 
 /// Little-endian helpers. Offsets are relative to `startIndex`: a `Data` that went through

@@ -243,7 +243,7 @@ private final class Recorder: @unchecked Sendable {
     func add(_ line: TraceLine) { lock.lock(); store.append(line); lock.unlock() }
 }
 
-private final class Box<T>: @unchecked Sendable {
+final class Box<T>: @unchecked Sendable {
     private let lock = NSLock()
     private var stored: T
     init(_ value: T) { stored = value }

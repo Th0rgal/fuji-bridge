@@ -645,8 +645,24 @@ enum Importer {
             let fileStart = io.now()
             io.file = options.live ? "#\(frame.handle)" : frame.name
             options.progress?(LiveProgress(index: index, count: queue.count, name: frame.name, got: 0, total: frame.bytes, bytesPerSecond: 0, copiedBytes: copiedBytes))
-            var info: Data
-            do {
+            // Fast path over Wi-Fi: three object properties instead of GetObjectInfo. Not while resizing, where
+            // the length has its own rules, and never again once the body failed to answer them.
+            var fast: (name: String, size: Int, date: String?)?
+            if fujiProps && io.resizeRate == nil && !io.slowInfoOnly {
+                let quickStart = io.now()
+                fast = await io.quickDescription(frame.handle, withDate: options.preview != nil)
+                if let fast {
+                    io.ok("Described #\(frame.handle)", "\(fast.name), \(ByteFormat.string(fast.size)) from object properties, no GetObjectInfo.", op: "info", took: io.now() - quickStart, bytes: fast.size)
+                } else {
+                    io.slowInfoOnly = true
+                    io.note("Object properties", "The body did not give a name and size by property. GetObjectInfo from now on.", op: "info")
+                }
+            }
+            var info = Data()
+            if let fast {
+                files[index].name = fast.name
+                io.file = fast.name
+            } else { do {
                 info = try await io.getData(Fuji.getObjectInfo, params: [UInt32(frame.handle)], title: options.live ? "GetObjectInfo #\(frame.handle)" : "GetObjectInfo \(frame.name)", op: "prep")
             } catch LinkError.response(let rc) {
                 if options.live && rc == Fuji.invalidObject {
@@ -662,8 +678,8 @@ enum Importer {
             } catch {
                 await link.close()
                 return RunResult(ok: false, reason: "link", summary: "GetObjectInfo failed. \(IO.describe(error))", files: files)
-            }
-            if let filename = ObjectInfo.filename(info) {
+            } }
+            if fast == nil, let filename = ObjectInfo.filename(info) {
                 let base = (filename as NSString).lastPathComponent
                 if !base.isEmpty, base != ".", base != ".." {
                     files[index].name = base
@@ -674,8 +690,8 @@ enum Importer {
                 files[index].state = "skipped"
                 continue
             }
-            var reported = (usb ? ObjectInfo.standardSize(info) : ObjectInfo.compressedSize(info)) ?? 0
-            if fujiProps, !io.realSizeInfo {
+            var reported = fast?.size ?? (usb ? ObjectInfo.standardSize(info) : ObjectInfo.compressedSize(info)) ?? 0
+            if fast == nil, fujiProps, !io.realSizeInfo {
                 if let size = await io.objectSize(frame.handle), size > 0 {
                     reported = size
                 } else {
@@ -697,7 +713,7 @@ enum Importer {
                 }
             }
             let maxPartial = !usb && info.count >= 12 ? Int(LE.u32(info, 8)) : Fuji.partialMax
-            io.note(
+            if fast == nil { io.note(
                 "ObjectInfo \(files[index].name)",
                 (reported == frame.bytes || frame.bytes == 0
                     ? "\(ByteFormat.string(reported)). " + (usb ? "Standard ObjectInfo, size at offset 8." : "compressed_size is the unaligned u32 at offset 13.")
@@ -707,8 +723,8 @@ enum Importer {
                 bytes: reported,
                 // Raw head of the record: the Wi-Fi layout (size at 13) differs from USB PTP (size at 8).
                 data: info
-            )
-            if info.count < 17 || reported == 0 {
+            ) }
+            if (fast == nil && info.count < 17) || reported == 0 {
                 if options.live {
                     files[index].state = "skipped"
                     io.note("Skip \(files[index].name)", "ObjectInfo had no compressed_size. Continuing with the next handle.", op: "file")
@@ -722,10 +738,23 @@ enum Importer {
             }
 
             if let preview = options.preview {
-                let thumb = (try? await io.getData(Fuji.getThumb, params: [UInt32(frame.handle)], title: "GetThumb \(files[index].name)", op: "thumb")) ?? Data()
+                var thumb = (try? await io.getData(Fuji.getThumb, params: [UInt32(frame.handle)], title: "GetThumb \(files[index].name)", op: "thumb")) ?? Data()
+                if thumb.isEmpty, fast != nil, !io.triedThumbFallback {
+                    io.triedThumbFallback = true
+                    // Some bodies may only serve a thumbnail after GetObjectInfo: ask it, retry, and if that was
+                    // the reason stay on the slow path for the rest of the card.
+                    if let described = try? await io.getData(Fuji.getObjectInfo, params: [UInt32(frame.handle)], title: "GetObjectInfo #\(frame.handle)", op: "prep") {
+                        info = described
+                        thumb = (try? await io.getData(Fuji.getThumb, params: [UInt32(frame.handle)], title: "GetThumb \(files[index].name)", op: "thumb")) ?? Data()
+                        if !thumb.isEmpty {
+                            io.slowInfoOnly = true
+                            io.note("Object properties", "The thumbnail only came after GetObjectInfo. GetObjectInfo from now on.", op: "info")
+                        }
+                    }
+                }
                 // The thumbnail is never rotated; the file's first 4 KB hold the EXIF orientation.
                 let head = (try? await io.getData(Fuji.getPartial, params: [UInt32(frame.handle), 0, 4096], title: "EXIF head \(files[index].name)", op: "thumb")) ?? Data()
-                preview(CardPhoto(handle: frame.handle, name: files[index].name, bytes: reported, captured: ObjectInfo.captureDate(info), thumb: thumb, orientation: Exif.orientation(head) ?? 1))
+                preview(CardPhoto(handle: frame.handle, name: files[index].name, bytes: reported, captured: fast?.date ?? ObjectInfo.captureDate(info), thumb: thumb, orientation: Exif.orientation(head) ?? 1))
                 files[index].total = reported
                 files[index].state = "previewed"
                 continue
@@ -1057,6 +1086,10 @@ final class IO: @unchecked Sendable {
     var realSizeInfo = false
     /// D22E while the body resizes, nil for originals.
     var resizeRate: UInt16?
+    /// The body did not answer ObjectFileName/ObjectSize: every file goes through GetObjectInfo.
+    var slowInfoOnly = false
+    /// Once per session: a missing thumbnail on the fast path gets one retry after GetObjectInfo.
+    var triedThumbFallback = false
     var forceCompression: UInt16 { resizeRate == nil ? 2 : 1 }
     var importHandles: [Int] = []
     var transport: Transport = .wifi
@@ -1229,6 +1262,21 @@ final class IO: @unchecked Sendable {
         if data.count >= 8 { return Int(LE.u32(data, 0)) | (Int(LE.u32(data, 4)) << 32) }
         if data.count >= 4 { return Int(LE.u32(data, 0)) }
         return nil
+    }
+
+    /// Name, length and (for the card grid) capture date from three object properties, ~10 ms each, instead
+    /// of GetObjectInfo (~500 ms each on an X100VI). Nil when the body does not answer them.
+    func quickDescription(_ handle: Int, withDate: Bool) async -> (name: String, size: Int, date: String?)? {
+        guard let size = await objectSize(handle), size > 0,
+              let raw = try? await getData(Fuji.getObjectPropValue, params: [UInt32(handle), Fuji.objectFileName], title: "ObjectFileName #\(handle)", op: "info"),
+              let name = PTPString.decode(raw).map({ ($0 as NSString).lastPathComponent }),
+              !name.isEmpty, name != ".", name != ".." else { return nil }
+        var date: String?
+        if withDate, let raw = try? await getData(Fuji.getObjectPropValue, params: [UInt32(handle), Fuji.dateCreated], title: "DateCreated #\(handle)", op: "info"),
+           let text = PTPString.decode(raw), text.count >= 15, text.first?.isNumber == true {
+            date = text
+        }
+        return (name, size, date)
     }
 
     func cameraState() async throws -> UInt32 {

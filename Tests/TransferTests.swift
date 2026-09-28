@@ -135,6 +135,47 @@ extension Data {
     }
 }
 
+/// Name, size and date by object property instead of GetObjectInfo (500–700 ms a file on an X100VI).
+final class ObjectPropsTests: XCTestCase {
+    func testImportAndListingSkipGetObjectInfoWhenTheBodyAnswersProperties() async {
+        let frames = Array(Catalog.roll.prefix(3))
+        let control = RunControl()
+        control.ok = true
+        let body = VirtualBody(faults: .none, control: control, frames: frames)
+        body.answersObjectProps = true
+        let result = await Importer.run(link: VirtualLink(body: body), options: RunOptions(kind: .bridge, frames: frames, faults: .none, control: control), log: { _ in })
+        XCTAssertTrue(result.ok, result.summary)
+        XCTAssertEqual(result.files.map(\.state), ["full", "full", "full"])
+        XCTAssertEqual(result.files.map(\.got), frames.map(\.bytes))
+        XCTAssertTrue(body.infoSeen.isEmpty, "GetObjectInfo was still asked")
+
+        let photos = Box<[CardPhoto]>([])
+        let listed = await Importer.run(link: VirtualLink(body: body), options: RunOptions(kind: .bridge, frames: frames, faults: .none, control: control, preview: { photos.value.append($0) }), log: { _ in })
+        XCTAssertTrue(listed.ok, listed.summary)
+        XCTAssertEqual(photos.value.map(\.name), frames.map(\.name))
+        XCTAssertEqual(photos.value.first?.captured, "20260924T195324")
+        XCTAssertTrue(body.infoSeen.isEmpty)
+    }
+
+    func testABodyWithoutPropertiesFallsBackOnceAndStays() async {
+        let frames = Array(Catalog.roll.prefix(3))
+        let control = RunControl()
+        control.ok = true
+        let body = VirtualBody(faults: .none, control: control, frames: frames)
+        var lines: [TraceLine] = []
+        let result = await Importer.run(link: VirtualLink(body: body), options: RunOptions(kind: .bridge, frames: frames, faults: .none, control: control), log: { lines.append($0) })
+        XCTAssertTrue(result.ok, result.summary)
+        XCTAssertEqual(body.infoSeen.count, 3)
+        XCTAssertEqual(lines.filter { $0.dir == "OUT" && $0.title.hasPrefix("ObjectFileName") }.count, 1)
+    }
+
+    func testPTPStringsRoundTrip() {
+        XCTAssertEqual(PTPString.decode(PTPString.encode("DSCF4418.JPG")), "DSCF4418.JPG")
+        XCTAssertNil(PTPString.decode(Data()))
+        XCTAssertNil(PTPString.decode(Data([0])))
+    }
+}
+
 /// The Wi-Fi session kept open between actions: browse, then import, without a second handshake.
 final class KeptSessionTests: XCTestCase {
     func testASecondRunReusesTheSessionWithoutAHandshake() async throws {
