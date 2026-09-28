@@ -634,6 +634,8 @@ struct HomeView: View {
             .padding(3)
             .background(Ink.surface, in: Capsule())
             .overlay(Capsule().strokeBorder(Ink.rule, lineWidth: 1))
+            // The tabs never give up their names; the action on the right shortens instead.
+            .fixedSize()
             Spacer(minLength: 8)
             galleryAction
         }
@@ -747,7 +749,7 @@ struct HomeView: View {
         case .camera:
             if model.cameraPhotos.isEmpty {
                 if model.busy && model.purpose == .browse {
-                    empty("Reading the card", "Thumbnails appear here as the camera sends them.", icon: "ellipsis")
+                    empty("Reading the card", "Thumbnails appear here as the camera sends them, newest first.", icon: "sdcard", working: true)
                 } else {
                     empty("See the card before importing", "Connect to see the photos on the camera, newest first, then pick the ones to import. Nothing is copied until you do.", icon: "camera",
                           action: ("Connect", "dot.radiowaves.left.and.right", { model.browse() }))
@@ -772,8 +774,12 @@ struct HomeView: View {
         case .camera:
             if !model.cameraPhotos.isEmpty && model.selection.isEmpty {
                 let fresh = freshHandles
-                headerButton("\(fresh.count) new", symbol: "checkmark.circle", help: "Select the photos that are not imported yet") { model.selection = Set(fresh) }
-                    .disabled(model.busy || fresh.isEmpty)
+                // "15 new" when there is room, "15" beside the check mark on a narrow phone.
+                ViewThatFits(in: .horizontal) {
+                    headerButton("\(fresh.count) new", symbol: "checkmark.circle", help: "Select the photos that are not imported yet") { model.selection = Set(fresh) }
+                    headerButton("\(fresh.count)", symbol: "checkmark.circle", help: "Select the \(fresh.count) photos that are not imported yet") { model.selection = Set(fresh) }
+                }
+                .disabled(model.busy || fresh.isEmpty)
             }
         }
     }
@@ -787,8 +793,10 @@ struct HomeView: View {
             }
             .font(Ink.side(.title))
             .foregroundStyle(Ink.ink)
+            .lineLimit(1)
             .padding(.horizontal, title == nil ? 0 : 12)
             .frame(minWidth: 36, minHeight: 36)
+            .fixedSize()
             .background(Ink.surface, in: Capsule())
             .overlay(Capsule().strokeBorder(Ink.rule, lineWidth: 1))
             .contentShape(Capsule())
@@ -831,13 +839,15 @@ struct HomeView: View {
         return wide ? 40 : cardHeight + headerHeight + 24 + 4
     }
 
-    private func empty(_ title: String, _ detail: String, icon: String, action: (String, String, () -> Void)? = nil) -> some View {
+    private func empty(_ title: String, _ detail: String, icon: String, working: Bool = false, action: (String, String, () -> Void)? = nil) -> some View {
         VStack(spacing: 12) {
             Image(systemName: icon)
                 .font(.system(size: 34, weight: .light))
                 .foregroundStyle(Ink.muted)
+                .symbolEffect(.pulse, options: .repeating, isActive: working)
                 .frame(width: 68, height: 68)
                 .background(Ink.surface, in: Circle())
+                .background { if working { BreathingRing() } }
                 .padding(.bottom, 6)
             Text(title)
                 .font(Ink.serif(26, .medium))
@@ -1977,6 +1987,23 @@ struct DiagnosticsView: View {
 }
 
 /// Icons for the stages of a run, joined by a line: done in green, the current one pulsing, the rest faint.
+/// A soft ring that grows out of a circle and fades, over and over: something is happening, quietly.
+struct BreathingRing: View {
+    @State private var out = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        Circle()
+            .strokeBorder(Ink.muted.opacity(0.5), lineWidth: 1)
+            .scaleEffect(out ? 1.45 : 1)
+            .opacity(out ? 0 : 0.8)
+            .onAppear {
+                guard !reduceMotion else { return }
+                withAnimation(.easeOut(duration: 1.8).repeatForever(autoreverses: false)) { out = true }
+            }
+    }
+}
+
 /// MB/s each second of the running import, newest on the right. Dips show a stall as it happens.
 struct RateSparkline: View {
     let values: [Double]

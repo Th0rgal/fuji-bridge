@@ -221,6 +221,28 @@ final class SessionTests: XCTestCase {
         XCTAssertEqual(body.partials.map(\.handle), [2, 2, 1, 1, 1])
     }
 
+    func testANewestFirstListStillGivesTheNewestPhotos() async {
+        // The X100VI lists D621 newest first (1802 … 1). "Newest 1" must be handle 9, not handle 2.
+        let frames = [
+            CardFrame(handle: 2, name: "DSCF0002.JPG", bytes: 400_000, recipe: ""),
+            CardFrame(handle: 4, name: "DSCF0004.JPG", bytes: 400_000, recipe: ""),
+            CardFrame(handle: 9, name: "DSCF0009.JPG", bytes: 400_000, recipe: ""),
+        ]
+        let control = RunControl()
+        control.ok = true
+        let body = VirtualBody(faults: .none, control: control, frames: frames)
+        body.listedHandles = [9, 4, 2]
+        var lines: [TraceLine] = []
+        let result = await Importer.run(
+            link: VirtualLink(body: body),
+            options: RunOptions(kind: .bridge, frames: [], faults: .none, control: control, live: true, latest: 2),
+            log: { lines.append($0) }
+        )
+        XCTAssertTrue(result.ok, result.summary)
+        XCTAssertEqual(result.files.map(\.handle), [9, 4])
+        XCTAssertTrue(lines.contains { $0.title == "Card order" })
+    }
+
     func testLiveSkipsADeadHandleAndKeepsTheNext() async {
         let frames = [
             CardFrame(handle: 4, name: "DSCF4436.JPG", bytes: 1_800_000, recipe: "Velvia"),
@@ -236,8 +258,9 @@ final class SessionTests: XCTestCase {
             listed: [4, 0, 9]
         )
         XCTAssertTrue(result.ok)
-        XCTAssertEqual(result.files.map(\.state), ["full", "skipped", "full"])
-        XCTAssertEqual(result.files.map(\.name), ["DSCF4490.JPG", "DSCF0000.JPG", "DSCF4436.JPG"])
+        // Sorted by handle, newest first: the dead handle 0 is the oldest and comes last.
+        XCTAssertEqual(result.files.map(\.state), ["full", "full", "skipped"])
+        XCTAssertEqual(result.files.map(\.name), ["DSCF4490.JPG", "DSCF4436.JPG", "DSCF0000.JPG"])
         XCTAssertFalse(body.partials.contains { $0.handle == 0 })
         XCTAssertEqual(body.partials.map(\.handle), [9, 4, 4])
     }

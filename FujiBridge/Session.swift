@@ -226,6 +226,13 @@ enum Importer {
                     files: files
                 )
             }
+            // Handles count up in shooting order (handle 26 is DSCF0026), but the X100VI lists D621 newest first:
+            // 1802, 1801 … 1. Taking "the last N" of that list took the oldest photos. Sort, then the rest holds.
+            let ordered = handles.sorted()
+            if ordered != handles, let first = handles.first, let last = handles.last {
+                io.note("Card order", "The body lists \(first) … \(last). Sorted by handle: oldest \(ordered[0]), newest \(ordered[ordered.count - 1]).", op: "setup")
+            }
+            handles = ordered
             options.cardCount?(handles.count)
             if let only = options.only {
                 handles = handles.filter { only.contains($0) }
