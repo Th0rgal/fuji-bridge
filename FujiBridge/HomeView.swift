@@ -15,6 +15,8 @@ struct HomeView: View {
     @State private var tab: GalleryTab = .camera
     /// Imported files picked in the grid, for Share and Delete. The camera's selection lives in the model.
     @State private var picked: Set<URL> = []
+    /// iPhone and iPad: "Select" was tapped, so a tap on a photo selects it instead of opening it.
+    @State private var selecting = false
     @State private var pickedAnchor: URL?
     @State private var cameraAnchor: Int?
     @State private var ratios: [URL: CGFloat] = [:]
@@ -82,6 +84,7 @@ struct HomeView: View {
                 }
                 tab = .camera
             }
+            if UserDefaults.standard.bool(forKey: "BridgeSelecting") { selecting = true }
             #endif
         }
     }
@@ -166,7 +169,10 @@ struct HomeView: View {
             if UserDefaults.standard.bool(forKey: "BridgeShowDiagnostics") { showDiagnostics = true }
             #endif
         }
-        .onChange(of: tab) { _, _ in syncToolbar() }
+        .onChange(of: tab) { _, _ in
+            selecting = false
+            syncToolbar()
+        }
         .onChange(of: showDiagnostics) { _, shown in MacToolbar.shared.setGalleryVisible(!shown) }
         .onChange(of: model.saved.count) { _, _ in syncToolbar() }
         .onChange(of: model.cameraPhotos.count) { _, _ in syncToolbar() }
@@ -655,54 +661,83 @@ struct HomeView: View {
     }
 
     /// Above the card's grid: how much of the card is listed, and a way to list more of it, a page at a time
-    /// or all of it, the grid filling as the thumbnails arrive.
+    /// or all of it, the grid filling as the thumbnails arrive. One height, one font, one icon size for both pills.
     @ViewBuilder
     private var cardBar: some View {
         let listing = model.busy && model.purpose == .browse && model.mode == .camera
         let shown = model.cameraPhotos.count
-        HStack(spacing: 14) {
-            Group {
-                if let total = model.cardTotal {
-                    Text(listing ? "Loading · \(shown) of \(total)" : (shown >= total ? "Whole card · \(total)" : "\(shown) of \(total) on the card"))
-                } else {
-                    Text(listing ? "Loading · \(shown)" : "\(shown) on the card")
+        HStack(alignment: .center, spacing: 8) {
+            HStack(spacing: 6) {
+                if listing {
+                    ProgressView().controlSize(.mini)
                 }
-            }
-            .font(Ink.side(.detail))
-            .monospacedDigit()
-            .foregroundStyle(Ink.ink2)
-            if listing {
-                ProgressView().controlSize(.small)
+                Group {
+                    if let total = model.cardTotal {
+                        Text(shown >= total && !listing ? "All \(total.formatted()) on the card" : "\(shown.formatted()) of \(total.formatted()) on the card")
+                    } else {
+                        Text("\(shown.formatted()) on the card")
+                    }
+                }
+                .font(Ink.side(.detail))
+                .monospacedDigit()
+                .foregroundStyle(Ink.ink2)
+                .lineLimit(1)
+                .contentTransition(.numericText())
             }
             Spacer(minLength: 8)
             if listing {
-                LinkButton(title: "Stop", systemImage: "stop.circle") { model.stop() }
+                barPill("Stop", symbol: "stop.fill") { model.stop() }
+                    .help("Stop listing")
             } else if (model.cardRemaining ?? 1) > 0 {
+                let page = min(model.browsePage, model.cardRemaining ?? model.browsePage)
                 Menu {
-                    ForEach([25, 100, 500], id: \.self) { page in
-                        Button("\(page) more") {
-                            model.browsePage = page
-                            model.browseMore(page)
+                    ForEach([25, 100, 500], id: \.self) { size in
+                        Button("\(size) more") {
+                            model.browsePage = size
+                            model.browseMore(size)
                         }
                     }
                 } label: {
-                    Label("\(min(model.browsePage, model.cardRemaining ?? model.browsePage)) more", systemImage: "arrow.down.circle")
-                        .font(Ink.side(.title))
-                        .foregroundStyle(Ink.ink)
+                    pillLabel("\(page.formatted()) more", symbol: "plus")
                 } primaryAction: {
                     model.browseMore(model.browsePage)
                 }
                 .menuStyle(.button)
-                .buttonStyle(.plain)
+                .buttonStyle(InkPress())
+                .menuIndicator(.hidden)
                 .fixedSize()
                 .disabled(model.busy)
-                .help("List older photos from the card")
-                LinkButton(title: "Load all", systemImage: "arrow.down.to.line") { model.browseMore(nil) }
+                .help("List older photos from the card (hold for other amounts)")
+                barPill("All", symbol: "arrow.down.to.line") { model.browseMore(nil) }
                     .disabled(model.busy)
                     .help("Keep listing until the whole card is here")
             }
         }
-        .padding(.horizontal, 4)
+        .padding(.horizontal, 2)
+    }
+
+    /// The small buttons of the card row: 28 points high, the same icon weight and size as their text.
+    private func barPill(_ title: String, symbol: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) { pillLabel(title, symbol: symbol) }
+            .buttonStyle(InkPress())
+    }
+
+    private func pillLabel(_ title: String, symbol: String) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: symbol)
+                .font(.system(size: 10, weight: .bold))
+                .frame(width: 12)
+            Text(title)
+                .font(Ink.side(.detail, .semibold))
+                .monospacedDigit()
+        }
+        .foregroundStyle(Ink.ink)
+        .lineLimit(1)
+        .padding(.horizontal, 11)
+        .frame(height: 28)
+        .background(Ink.surface, in: Capsule())
+        .overlay(Capsule().strokeBorder(Ink.rule, lineWidth: 1))
+        .contentShape(Capsule())
     }
 
     private func tabButton(_ value: GalleryTab, _ title: String, symbol: String, count: Int?) -> some View {
@@ -749,7 +784,9 @@ struct HomeView: View {
                 JustifiedGrid(items: model.saved.map(LocalItem.init), ratio: { ratios[$0.url] ?? ImageRatio.standard }, rowHeight: rowHeight) { item, _ in
                     let url = item.url
                     LocalTile(url: url, selected: picked.contains(url))
-                        .selectable(open: { openViewer(.local(url)) }) { kind in clickImported(url, kind) }
+                        .selectable(open: { openViewer(.local(url)) }) { kind in
+                            if choosing { clickImported(url, kind) } else { openViewer(.local(url)) }
+                        }
                         .contextMenu { importedMenu(url) }
                 }
                 .task(id: model.saved) {
@@ -769,18 +806,56 @@ struct HomeView: View {
                 }
             } else {
                 cardBar
-                    .padding(.bottom, 10)
+                    .padding(.top, 12)
+                    .padding(.bottom, 12)
                 JustifiedGrid(items: model.cameraPhotos, ratio: CameraThumb.ratio, rowHeight: rowHeight) { photo, _ in
                     CameraTile(photo: photo, selected: model.selection.contains(photo.handle), imported: model.importedNames.contains(photo.name))
-                        .selectable(open: { openViewer(.camera(photo)) }) { kind in clickCamera(photo, kind) }
+                        .selectable(open: { openViewer(.camera(photo)) }) { kind in
+                            if choosing { clickCamera(photo, kind) } else { openViewer(.camera(photo)) }
+                        }
                         .contextMenu { cameraMenu(photo) }
                 }
             }
         }
     }
 
+    /// A tap selects rather than opens: always on the Mac (a double-click opens), on touch once "Select" is on
+    /// or something is already selected, as in Photos.
+    private var choosing: Bool {
+        Ink.isMac || selecting || (tab == .camera ? !model.selection.isEmpty : !picked.isEmpty)
+    }
+
+    private var hasPhotos: Bool { tab == .camera ? !model.cameraPhotos.isEmpty : !model.saved.isEmpty }
+
+    /// Select / Done, as in Photos. "Select" folds to its icon when the row is tight.
+    @ViewBuilder
+    private var selectToggle: some View {
+        if choosing {
+            headerButton("Done", symbol: "checkmark", help: "Leave selection") { clearSelection() }
+        } else {
+            ViewThatFits(in: .horizontal) {
+                headerButton("Select", symbol: "checkmark.circle", help: "Select photos") { withAnimation(.snappy(duration: 0.2)) { selecting = true } }
+                headerButton(nil, symbol: "checkmark.circle", help: "Select photos") { withAnimation(.snappy(duration: 0.2)) { selecting = true } }
+            }
+        }
+    }
+
     @ViewBuilder
     private var galleryAction: some View {
+        if !Ink.isMac {
+            HStack(spacing: 6) {
+                if hasPhotos { selectToggle }
+                if tab == .imported {
+                    headerButton(nil, symbol: "folder", help: "Open in Files") { model.revealPhotos() }
+                }
+            }
+        } else {
+            macGalleryAction
+        }
+    }
+
+    @ViewBuilder
+    private var macGalleryAction: some View {
         switch tab {
         case .imported:
             headerButton(nil, symbol: "folder", help: Ink.isMac ? "Show in Finder" : "Open in Files") { model.revealPhotos() }
@@ -979,14 +1054,24 @@ struct HomeView: View {
     @ViewBuilder
     private var selectionBar: some View {
         let count = tab == .imported ? picked.count : model.selection.count
-        if count > 0 {
+        if count > 0 || (selecting && !Ink.isMac) {
             HStack(spacing: 14) {
-                Text("\(count) selected")
+                Text(count == 0 ? "Tap photos" : "\(count) selected")
                     .font(Ink.mono(13, .medium))
-                    .foregroundStyle(Ink.ink)
+                    .foregroundStyle(count == 0 ? Ink.ink2 : Ink.ink)
                     .monospacedDigit()
                 Spacer(minLength: 4)
-                if tab == .imported {
+                if count == 0 {
+                    if tab == .camera, !freshHandles.isEmpty {
+                        Button { model.selection = Set(freshHandles) } label: {
+                            Label("\(freshHandles.count) new", systemImage: "checkmark.circle")
+                                .font(Ink.prose(14, .semibold))
+                        }
+                        .foregroundStyle(Ink.ink)
+                        .disabled(model.busy)
+                        .help("Select the photos that are not imported yet")
+                    }
+                } else if tab == .imported {
                     ShareLink(items: Array(picked)) {
                         Label("Share", systemImage: "square.and.arrow.up").labelStyle(.iconOnly)
                     }
@@ -1005,16 +1090,9 @@ struct HomeView: View {
                     .font(.system(size: 16, weight: .medium))
                     .foregroundStyle(Ink.bad)
                     .disabled(model.busy)
+                    .opacity(model.busy ? 0.35 : 1)
                     .help("Delete from the camera")
-                    Button { model.importFromCamera() } label: {
-                        Label("Import", systemImage: "arrow.down.to.line")
-                            .font(Ink.prose(14, .semibold))
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 6)
-                            .foregroundStyle(Ink.paper)
-                            .background(Ink.ink, in: Capsule())
-                    }
-                    .disabled(model.busy)
+                    importSplit
                 }
                 Button { clearSelection() } label: {
                     Image(systemName: "xmark")
@@ -1038,6 +1116,59 @@ struct HomeView: View {
             .padding(.bottom, 10)
             .transition(.move(edge: .bottom).combined(with: .opacity))
         }
+    }
+
+    /// Import the selection, with the size beside it; greyed with a spinner while an import runs, so a second
+    /// tap has nothing to hit.
+    private var importSplit: some View {
+        let importing = model.busy && model.mode == .camera
+        return HStack(spacing: 0) {
+            Button { model.importFromCamera() } label: {
+                HStack(spacing: 6) {
+                    if importing {
+                        ProgressView().controlSize(.mini).tint(Ink.paper)
+                    } else {
+                        Image(systemName: "arrow.down.to.line")
+                    }
+                    Text(importing ? "Importing" : "Import")
+                }
+                .lineLimit(1)
+                .fixedSize()
+                .font(Ink.prose(14, .semibold))
+                .padding(.leading, 12)
+                .padding(.trailing, 9)
+                .padding(.vertical, 6)
+                .contentShape(Rectangle())
+            }
+            Rectangle().fill(Ink.paper.opacity(0.3)).frame(width: 1, height: 16)
+            Menu {
+                Picker("Size over Wi-Fi", selection: Binding(get: { model.importSize }, set: { model.importSize = $0 })) {
+                    ForEach(ImportSize.allCases) { size in
+                        Text(size == .original ? "Original (recommended)" : "\(size.label) (experimental)").tag(size)
+                    }
+                }
+                .pickerStyle(.inline)
+            } label: {
+                HStack(spacing: 3) {
+                    if model.importSize != .original { Text(model.importSize.short) }
+                    Image(systemName: "chevron.down").font(.system(size: 9, weight: .bold))
+                }
+                .font(Ink.prose(13, .semibold))
+                .padding(.leading, 8)
+                .padding(.trailing, 11)
+                .padding(.vertical, 6)
+                .contentShape(Rectangle())
+            }
+            .menuStyle(.button)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Size over Wi-Fi")
+        }
+        .foregroundStyle(Ink.paper)
+        .background(Ink.ink, in: Capsule())
+        .disabled(model.busy)
+        .opacity(model.busy && !importing ? 0.4 : (importing ? 0.55 : 1))
+        .animation(.snappy(duration: 0.2), value: importing)
     }
 
     // MARK: Viewer
@@ -1137,6 +1268,7 @@ struct HomeView: View {
 
     private func clearSelection() {
         if tab == .imported { picked = [] } else { model.selection = [] }
+        withAnimation(.snappy(duration: 0.2)) { selecting = false }
     }
 
     private func selectAll() {
