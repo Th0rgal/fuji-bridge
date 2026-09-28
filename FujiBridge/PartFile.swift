@@ -84,3 +84,25 @@ final class PartFile {
             .reduce(0, +)
     }
 }
+
+/// Whether a saved photo is whole. A JPEG starts with FF D8 and ends with the FF D9 end-of-image marker;
+/// a transfer cut short keeps the start and loses the end, and shows as a grey lower half.
+enum JPEGCheck {
+    static func applies(_ url: URL) -> Bool {
+        ["jpg", "jpeg"].contains(url.pathExtension.lowercased())
+    }
+
+    /// True for a whole JPEG, and for anything that is not a JPEG (nothing to check).
+    static func complete(_ url: URL) -> Bool {
+        guard applies(url) else { return true }
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        guard let head = try? handle.read(upToCount: 2), head == Data([0xff, 0xd8]),
+              let size = try? handle.seekToEnd(), size > 4 else { return false }
+        // Some writers pad after the marker; look in the last 64 bytes.
+        let tail = min(size, 64)
+        try? handle.seek(toOffset: size - tail)
+        guard let end = try? handle.readToEnd() else { return false }
+        return zip(end, end.dropFirst()).contains { $0 == 0xff && $1 == 0xd9 }
+    }
+}

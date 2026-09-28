@@ -11,7 +11,8 @@ enum GalleryTab: String, CaseIterable, Identifiable {
 /// a phone gets the controls on top of the same grid. Same views either way.
 struct HomeView: View {
     @State private var model = BenchModel()
-    @State private var tab: GalleryTab = .imported
+    /// The camera first: open the app, connect, see what is on the card.
+    @State private var tab: GalleryTab = .camera
     /// Imported files picked in the grid, for Share and Delete. The camera's selection lives in the model.
     @State private var picked: Set<URL> = []
     @State private var pickedAnchor: URL?
@@ -67,7 +68,7 @@ struct HomeView: View {
         .onChange(of: model.saved) { _, saved in picked.formIntersection(saved) }
         .onAppear {
             model.refreshSaved()
-            if UserDefaults.standard.string(forKey: "BridgeAutoRun") == "browse" || UserDefaults.standard.string(forKey: "BridgeTab") == "camera" { tab = .camera }
+            if UserDefaults.standard.string(forKey: "BridgeTab") == "imported" { tab = .imported }
             #if DEBUG
             // Store screenshots: -BridgeDemoCamera X100VI shows a paired body without Bluetooth.
             if let name = UserDefaults.standard.string(forKey: "BridgeDemoCamera") {
@@ -356,6 +357,17 @@ struct HomeView: View {
         actionRow
     }
 
+    /// Connect first (the camera's photos appear in Camera, nothing copied), then Refresh; Import N with a selection.
+    private var primaryTitle: String {
+        if !model.selection.isEmpty { return "Import \(model.selection.count)" }
+        return model.cameraPhotos.isEmpty ? "Connect" : "Refresh"
+    }
+
+    private var primarySymbol: String {
+        if !model.selection.isEmpty { return "arrow.down.to.line" }
+        return model.cameraPhotos.isEmpty ? "dot.radiowaves.left.and.right" : "arrow.clockwise"
+    }
+
     /// Reading the card is the main action: look first, then import what you pick. With a selection the same
     /// button imports it. Quick import (the newest not here yet, no looking) sits beside it as an icon.
     private var actionRow: some View {
@@ -369,8 +381,7 @@ struct HomeView: View {
                         model.importFromCamera()
                     }
                 } label: {
-                    Label(model.selection.isEmpty ? "Read the card" : "Import \(model.selection.count)",
-                          systemImage: model.selection.isEmpty ? "square.grid.2x2" : "arrow.down.to.line")
+                    Label(primaryTitle, systemImage: primarySymbol)
                         .font(Ink.side(.title, .semibold))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 9)
@@ -386,7 +397,7 @@ struct HomeView: View {
                     Section("Size over Wi-Fi") {
                         Picker("Size over Wi-Fi", selection: $model.importSize) {
                             ForEach(ImportSize.allCases) { size in
-                                Text(size == .small ? "Resized S (recommended)" : size.label).tag(size)
+                                Text(size == .original ? "Original (recommended)" : "\(size.label) (experimental)").tag(size)
                             }
                         }
                         .pickerStyle(.inline)
@@ -613,10 +624,16 @@ struct HomeView: View {
     }
 
     private var galleryHeader: some View {
-        // The two tabs and the action share one look: an icon and a word, like the Files button.
-        HStack(alignment: .center, spacing: 4) {
-            tabButton(.imported, "Imported", symbol: "photo.on.rectangle", count: model.saved.count)
-            tabButton(.camera, "Camera", symbol: "camera", count: model.cameraPhotos.isEmpty ? nil : model.cameraPhotos.count)
+        // One segmented control for the two grids, camera first; the tab's own action on the right,
+        // drawn with the same surface and height so the row reads as one piece.
+        HStack(alignment: .center, spacing: 8) {
+            HStack(spacing: 2) {
+                tabButton(.camera, "Camera", symbol: "camera", count: model.cameraPhotos.isEmpty ? nil : model.cameraPhotos.count)
+                tabButton(.imported, "Imported", symbol: "photo.on.rectangle", count: model.saved.count)
+            }
+            .padding(3)
+            .background(Ink.surface, in: Capsule())
+            .overlay(Capsule().strokeBorder(Ink.rule, lineWidth: 1))
             Spacer(minLength: 8)
             galleryAction
         }
@@ -688,12 +705,18 @@ struct HomeView: View {
                         .foregroundStyle(Ink.ink2)
                 }
             }
-            .font(Ink.side(.title))
+            .font(Ink.side(.title, on ? .semibold : .regular))
             .foregroundStyle(on ? Ink.ink : Ink.ink2)
             .lineLimit(1)
-            .padding(.horizontal, 10)
+            .padding(.horizontal, 12)
             .padding(.vertical, 6)
-            .background(on ? Ink.surface2 : .clear, in: Capsule())
+            .background {
+                if on {
+                    Capsule().fill(Ink.raised)
+                        .overlay(Capsule().strokeBorder(Ink.rule, lineWidth: 1))
+                        .shadow(color: .black.opacity(0.12), radius: 2, y: 1)
+                }
+            }
             .contentShape(Capsule())
         }
         .buttonStyle(InkPress())
@@ -705,8 +728,8 @@ struct HomeView: View {
         switch tab {
         case .imported:
             if model.saved.isEmpty {
-                empty("Nothing imported yet", "Read the card, pick photos, and they land in \(Ink.isMac ? "Pictures › Fuji Bridge" : "Files › Fuji Bridge"), newest first.", icon: "photo.on.rectangle.angled",
-                      action: ("Read the card", "square.grid.2x2", { tab = .camera; model.browse() }))
+                empty("Nothing imported yet", "Connect, pick photos in Camera, and they land in \(Ink.isMac ? "Pictures › Fuji Bridge" : "Files › Fuji Bridge"), newest first.", icon: "photo.on.rectangle.angled",
+                      action: ("Connect", "dot.radiowaves.left.and.right", { tab = .camera; model.browse() }))
             } else {
                 JustifiedGrid(items: model.saved.map(LocalItem.init), ratio: { ratios[$0.url] ?? ImageRatio.standard }, rowHeight: rowHeight) { item, _ in
                     let url = item.url
@@ -726,8 +749,8 @@ struct HomeView: View {
                 if model.busy && model.purpose == .browse {
                     empty("Reading the card", "Thumbnails appear here as the camera sends them.", icon: "ellipsis")
                 } else {
-                    empty("See the card before importing", "Read the card to see its photos, then pick the ones to import. Fuji Bridge reads the \(model.scope == .all ? "whole card" : model.scope.label.lowercased()), as set next to the button.", icon: "camera",
-                          action: ("Read the card", "square.grid.2x2", { model.browse() }))
+                    empty("See the card before importing", "Connect to see the photos on the camera, newest first, then pick the ones to import. Nothing is copied until you do.", icon: "camera",
+                          action: ("Connect", "dot.radiowaves.left.and.right", { model.browse() }))
                 }
             } else {
                 cardBar
@@ -745,14 +768,34 @@ struct HomeView: View {
     private var galleryAction: some View {
         switch tab {
         case .imported:
-            LinkButton(title: Ink.isMac ? "Show in Finder" : "Files", systemImage: "folder") { model.revealPhotos() }
+            headerButton(nil, symbol: "folder", help: Ink.isMac ? "Show in Finder" : "Open in Files") { model.revealPhotos() }
         case .camera:
             if !model.cameraPhotos.isEmpty && model.selection.isEmpty {
                 let fresh = freshHandles
-                LinkButton(title: "\(fresh.count) new", systemImage: "checkmark.circle") { model.selection = Set(fresh) }
+                headerButton("\(fresh.count) new", symbol: "checkmark.circle", help: "Select the photos that are not imported yet") { model.selection = Set(fresh) }
                     .disabled(model.busy || fresh.isEmpty)
             }
         }
+    }
+
+    /// A round (icon) or capsule (icon and word) button the height of the segmented control beside it.
+    private func headerButton(_ title: String?, symbol: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: symbol)
+                if let title { Text(title).monospacedDigit() }
+            }
+            .font(Ink.side(.title))
+            .foregroundStyle(Ink.ink)
+            .padding(.horizontal, title == nil ? 0 : 12)
+            .frame(minWidth: 36, minHeight: 36)
+            .background(Ink.surface, in: Capsule())
+            .overlay(Capsule().strokeBorder(Ink.rule, lineWidth: 1))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(InkPress())
+        .help(help)
+        .accessibilityLabel(title ?? help)
     }
 
     /// What the toolbar's right button says and does, mirroring `galleryAction`.

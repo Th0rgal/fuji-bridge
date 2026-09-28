@@ -41,7 +41,10 @@ final class TransferTests: XCTestCase {
         // 1.5 MB already here, plus 100 bytes of a window that was cut: the tail is dropped to stay aligned.
         let kept = 3 * 512 * 1024 + 100
         let part = dir.appendingPathComponent(PartFile.partName(frame.name, total: frame.bytes))
-        try Data(count: kept).write(to: part)
+        var head = Data(count: kept)
+        head[0] = 0xff
+        head[1] = 0xd8
+        try head.write(to: part)
         let (result, body, lines) = await run([frame])
         XCTAssertTrue(result.ok)
         XCTAssertEqual(result.files[0].state, "full")
@@ -51,6 +54,27 @@ final class TransferTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: saved.path)[.size] as? Int, frame.bytes)
         XCTAssertFalse(FileManager.default.fileExists(atPath: part.path))
         XCTAssertEqual(Diagnostics.transferStat(lines)?.resumedBytes, 3 * 512 * 1024)
+    }
+
+    func testAHalfJPEGIsNotKeptAndABrokenCopyIsFetchedAgain() async throws {
+        XCTAssertTrue(JPEGCheck.complete(try write(Data.jpeg(count: 5000), "A.JPG")))
+        XCTAssertFalse(JPEGCheck.complete(try write(Data.jpeg(count: 5000).prefix(3000), "B.JPG")))
+        XCTAssertTrue(JPEGCheck.complete(try write(Data(count: 10), "C.RAF")))
+        // A copy cut short by an older build, with the right size: fetched again, not "already here".
+        let frame = Catalog.roll[0]
+        var broken = Data.jpeg(count: frame.bytes)
+        broken[frame.bytes - 1] = 0
+        _ = try write(broken, frame.name)
+        let (result, body, _) = await run([frame])
+        XCTAssertEqual(result.files[0].state, "full")
+        XCTAssertFalse(body.partials.isEmpty)
+        XCTAssertTrue(JPEGCheck.complete(dir.appendingPathComponent(frame.name)))
+    }
+
+    private func write(_ data: Data, _ name: String) throws -> URL {
+        let url = dir.appendingPathComponent(name)
+        try data.write(to: url)
+        return url
     }
 
     func testAPartForAnotherSizeIsThrownAway() async throws {
@@ -95,5 +119,18 @@ final class TransferTests: XCTestCase {
         XCTAssertEqual(bench.map(\.window), sizes.map { ByteFormat.string($0) })
         XCTAssertTrue(bench.allSatisfy { $0.ok && $0.bytes == frame.bytes })
         XCTAssertEqual(body.compressSmall, 0)
+    }
+}
+
+extension Data {
+    /// Zeros with a JPEG's start and end markers, enough for the importer's completeness check.
+    static func jpeg(count: Int) -> Data { jpegShaped(Data(count: count)) }
+
+    static func jpegShaped(_ data: Data) -> Data {
+        var data = data
+        guard data.count >= 4 else { return data }
+        data[0] = 0xff; data[1] = 0xd8
+        data[data.count - 2] = 0xff; data[data.count - 1] = 0xd9
+        return data
     }
 }

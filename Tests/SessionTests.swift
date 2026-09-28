@@ -157,6 +157,24 @@ final class SessionTests: XCTestCase {
         XCTAssertEqual(body.correctSize, 0)
     }
 
+    func testAResizedFileShorterThanAnnouncedEndsInsteadOfLooping() async {
+        let frames = Array(Catalog.roll.prefix(2))
+        let control = RunControl()
+        control.ok = true
+        let body = VirtualBody(faults: .none, control: control, frames: frames)
+        body.announcesOriginalWhenResizing = true
+        let result = await Importer.run(
+            link: VirtualLink(body: body),
+            options: RunOptions(kind: .bridge, frames: frames, faults: .none, control: control, size: .small),
+            log: { _ in }
+        )
+        XCTAssertTrue(result.ok, result.summary)
+        XCTAssertEqual(result.files.map(\.state), ["full", "full"])
+        XCTAssertEqual(result.files.map(\.got), frames.map { $0.bytes / 8 })
+        // One or two asks past the end per file, not 1,510.
+        XCTAssertLessThan(body.partials.count, 12)
+    }
+
     func testReconnectResetsTheTransactionId() async {
         let frame = Catalog.roll[0]
         let faults = Faults(flakyHandshake: true, requireOk: false, stallChunk: true, lieAboutSize: true, impatientOpen: false)
@@ -322,7 +340,7 @@ final class SessionTests: XCTestCase {
             CardFrame(handle: 4, name: "DSCF4436.JPG", bytes: 1_800_000, recipe: ""),
             CardFrame(handle: 9, name: "DSCF4490.JPG", bytes: 500_000, recipe: ""),
         ]
-        try? Data(count: 1_800_000).write(to: dir.appendingPathComponent("DSCF4436.JPG"))
+        try? Data.jpeg(count: 1_800_000).write(to: dir.appendingPathComponent("DSCF4436.JPG"))
         let control = RunControl()
         control.ok = true
         let body = VirtualBody(faults: .none, control: control, frames: frames)

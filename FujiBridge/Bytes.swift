@@ -24,6 +24,8 @@ enum Fuji {
     /// MTP GetObjectPropValue. XApp reads a file's size as ObjectSize (0xDC04) with it, instead of turning on D227.
     static let getObjectPropValue: UInt16 = 0x9803
     static let objectSize: UInt32 = 0xdc04
+    /// What XApp asks instead of ObjectSize when the body compresses (resizes) the object.
+    static let compressedObjectSize: UInt32 = 0xd802
     static let ok: UInt16 = 0x2001
     static let invalidObject: UInt16 = 0x2009
     static let sessionAlreadyOpen: UInt16 = 0x201e

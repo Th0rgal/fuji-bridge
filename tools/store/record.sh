@@ -13,7 +13,7 @@ sim_rec() { # sim_rec DEVICE FILE SECONDS
 sim_set() { # sim_set DEVICE PREFIX
   local d=$1 p=$2
   start_fakecam $(fresh_card $p-video)
-  sim_launch $d -BridgeHost 127.0.0.1 -BridgeAutoRun camera -BridgeLatest 4; sleep 2
+  sim_launch $d -BridgeHost 127.0.0.1 -BridgeAutoRun camera -BridgeLatest 4 -BridgeTab imported; sleep 2
   sim_rec $d $VIDEO/$p-import.mp4 11; stop_fakecam
   sim_launch $d -BridgeDemoCard YES; sleep 20
   sim_rec $d $VIDEO/$p-card.mp4 5
@@ -29,7 +29,7 @@ mac_fix() { # mac_fix NAME
 }
 mac_set() {
   start_fakecam $(fresh_card mac-video)
-  mac_launch -BridgeHost 127.0.0.1 -BridgeAutoRun camera -BridgeLatest 4; sleep 3
+  mac_launch -BridgeHost 127.0.0.1 -BridgeAutoRun camera -BridgeLatest 4 -BridgeTab imported; sleep 3
   $WINREC "Fuji Bridge" 10 $VIDEO/mac-import.mov; stop_fakecam
   mac_launch -BridgeDemoCard YES; sleep 20
   $WINREC "Fuji Bridge" 5 $VIDEO/mac-card.mov

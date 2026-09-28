@@ -164,6 +164,8 @@ final class VirtualBody: @unchecked Sendable {
     var shortWindow: Int?
     /// Test hook: a body without ObjectSize, so the importer has to fall back to D227.
     var answersObjectSize = true
+    /// Test hook, as an X100VI does: while resizing, ObjectInfo still gives the original's length.
+    var announcesOriginalWhenResizing = false
 
     private func partial(handle: Int, offset: Int, ask: Int, code: UInt16, tid: UInt32) -> Reply {
         let total = frames.first { $0.handle == handle }.map { served($0.bytes) } ?? ask
@@ -175,10 +177,10 @@ final class VirtualBody: @unchecked Sendable {
         }
         if stallArmed && give > Fuji.stallBytes {
             stallArmed = false
-            let payload = Data(count: Fuji.stallBytes)
+            let payload = jpeg(total: total, offset: offset, count: Fuji.stallBytes)
             return .stall(Packets.dataPhase(code: code, tid: tid, payload: payload))
         }
-        let payload = Data(count: give)
+        let payload = jpeg(total: total, offset: offset, count: give)
         return .bytes(Packets.dataPhase(code: code, tid: tid, payload: payload)
             + Packets.response(code: code, tid: tid))
     }
@@ -231,6 +233,15 @@ final class VirtualBody: @unchecked Sendable {
         }
     }
 
+    /// Zeros shaped like a JPEG: FF D8 at the start, FF D9 at the end, so the importer's completeness check passes.
+    private func jpeg(total: Int, offset: Int, count: Int) -> Data {
+        var data = Data(count: count)
+        for (at, byte) in [(0, UInt8(0xff)), (1, 0xd8), (total - 2, 0xff), (total - 1, 0xd9)] where at >= offset && at < offset + count {
+            data[at - offset] = byte
+        }
+        return data
+    }
+
     /// While D226 = 1 the body sends a resized JPEG: an eighth of the file for S, a sixteenth for XS.
     private func served(_ bytes: Int) -> Int {
         guard compressSmall == 1 else { return bytes }
@@ -239,7 +250,7 @@ final class VirtualBody: @unchecked Sendable {
 
     private func objectInfo(_ handle: Int) -> Data {
         let frame = frames.first { $0.handle == handle }
-        let real = served(frame?.bytes ?? 0)
+        let real = announcesOriginalWhenResizing ? (frame?.bytes ?? 0) : served(frame?.bytes ?? 0)
         let reported = (faults.lieAboutSize && correctSize == 0) ? Fuji.liedSize : real
         infoSeen.append((handle, compressSmall, correctSize, reported))
         return ObjectInfo.payload(name: frame?.name ?? "", bytes: reported, maxPartial: Fuji.partialMax)

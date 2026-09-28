@@ -505,6 +505,14 @@ enum Diagnostics {
         if !skipped.isEmpty {
             add("info", "\(skipped.count) handle\(skipped.count == 1 ? "" : "s") skipped", skipped.map { "\($0.handle)" }.joined(separator: ", "))
         }
+        let broken = result.files.filter { $0.state == "corrupt" }
+        if !broken.isEmpty {
+            add("error", "\(broken.count) incomplete JPEG\(broken.count == 1 ? "" : "s") not kept", broken.map(\.name).joined(separator: ", ") + ". The bytes ended without the JPEG end marker.")
+        }
+        let eof = lines.filter { $0.op == "eof" }
+        if !eof.isEmpty {
+            add("info", "\(eof.count) file\(eof.count == 1 ? "" : "s") shorter than announced", "The body gave a length, then stopped earlier. Normal for resized files. " + (eof.first?.detail ?? ""))
+        }
         let already = result.files.filter { $0.state == "already" }
         if !already.isEmpty {
             add("info", "\(already.count) already here", "Same name and size already in the photos folder, not copied again.")

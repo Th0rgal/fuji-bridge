@@ -126,9 +126,11 @@ final class BenchModel {
     var windowSize: Int = UserDefaults.standard.object(forKey: "BridgeWindow") as? Int ?? Fuji.partialMax {
         didSet { UserDefaults.standard.set(windowSize, forKey: "BridgeWindow") }
     }
-    /// Wi-Fi imports only: resized by the camera (S by default, the radio is slow), or originals.
-    var importSize: ImportSize = ImportSize(rawValue: UserDefaults.standard.string(forKey: "BridgeImportSize") ?? "") ?? .small {
-        didSet { UserDefaults.standard.set(importSize.rawValue, forKey: "BridgeImportSize") }
+    /// Wi-Fi imports only: originals, or resized by the camera. Resizing is experimental: on an X100VI the body
+    /// announces the original's length and sends less, and an older build saved half pictures from it.
+    /// A new key, so everyone who had S from the earlier default starts again on Original.
+    var importSize: ImportSize = ImportSize(rawValue: UserDefaults.standard.string(forKey: "BridgeImportSize2") ?? "") ?? .original {
+        didSet { UserDefaults.standard.set(importSize.rawValue, forKey: "BridgeImportSize2") }
     }
     var host: String = UserDefaults.standard.string(forKey: "BridgeHost") ?? Fuji.cameraHost {
         didSet { UserDefaults.standard.set(host, forKey: "BridgeHost") }

@@ -619,6 +619,14 @@ enum Importer {
                     }
                 }
             }
+            if fujiProps, io.resizeRate != nil {
+                // Resizing, ObjectInfo still gives the original's length (seen on an X100VI: 9.5 MB for a 3.8 MB
+                // resized file). XApp reads 0xD802 for a compressed object; the end-of-file check below is the net.
+                if let size = await io.objectSize(frame.handle, prop: Fuji.compressedObjectSize), size > 0, size < reported {
+                    io.note("Resized size", "\(ByteFormat.string(size)) instead of the original's \(ByteFormat.string(reported)).", op: "info", bytes: size)
+                    reported = size
+                }
+            }
             let maxPartial = !usb && info.count >= 12 ? Int(LE.u32(info, 8)) : Fuji.partialMax
             io.note(
                 "ObjectInfo \(files[index].name)",
@@ -657,8 +665,13 @@ enum Importer {
             if kind == .bridge, options.skipExisting, let dir = options.saveDirectory {
                 let url = dir.appendingPathComponent(files[index].name)
                 let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue
-                // A resized copy never matches the original's size: any file by that name is enough.
-                if size == reported || (io.resizeRate != nil && (size ?? 0) > 0) {
+                // A resized copy never matches the original's size: any whole file by that name is enough.
+                // A JPEG cut short by an older build does not count: it is fetched again.
+                let whole = JPEGCheck.complete(url)
+                if !whole && (size ?? 0) > 0 {
+                    io.note("Broken copy", "\(files[index].name) on disk is not a whole JPEG. Fetching it again.", op: "file")
+                }
+                if whole && (size == reported || (io.resizeRate != nil && (size ?? 0) > 0)) {
                     files[index].got = reported
                     files[index].total = reported
                     files[index].state = "already"
@@ -688,7 +701,10 @@ enum Importer {
             }
 
             options.progress?(LiveProgress(index: index, count: queue.count, name: files[index].name, got: 0, total: reported, bytesPerSecond: 0, copiedBytes: copiedBytes))
-            let total = reported
+            var total = reported
+            // The object ended before the length the body gave (resized files do this): where, when seen twice.
+            var shortEnd: Int?
+            var endedEarly = false
             // Streamed to a hidden .part next to the photo, so a run that dies keeps what it got and the next
             // one resumes from there. Without a save directory (tests, the virtual body) the bytes are dropped.
             var sink: PartFile?
@@ -770,6 +786,12 @@ enum Importer {
                     return await giveUp("partial", summary)
                 }
                 if exchange.bytes == 0 {
+                    if offset > 0 {
+                        io.note("End of file at \(ByteFormat.string(offset))", "The body has nothing past \(offset) although it announced \(total). Taking that as the end.", op: "eof")
+                        total = offset
+                        endedEarly = true
+                        break
+                    }
                     let summary = "GetPartialObject returned no bytes for \(frame.name)."
                     io.fail("Empty partial", summary)
                     return await giveUp("partial", summary)
@@ -777,6 +799,18 @@ enum Importer {
                 guard write(exchange.payload) else { return await giveUp("save", "Could not write \(files[index].name) to disk.") }
                 stuck = 0
                 offset += exchange.bytes
+                if exchange.bytes < ask && offset < total {
+                    // A short window mid-file is usually a hiccup: realign and ask again. The same short answer
+                    // at the same place twice means the object really ends there. Without this, a resized file
+                    // (shorter than announced) was asked for its last 257 bytes 1,510 times in a row.
+                    if shortEnd == offset {
+                        io.note("End of file at \(ByteFormat.string(offset))", "Twice the body stopped at \(offset) of the announced \(total). Taking that as the end.", op: "eof")
+                        total = offset
+                        endedEarly = true
+                        break
+                    }
+                    shortEnd = offset
+                }
                 realign()
                 files[index].got = offset
                 let seconds = max(0.001, (io.now() - pullStart) / 1000)
@@ -786,7 +820,7 @@ enum Importer {
             transferMs += pullMs
             copiedBytes += offset - resumedAt
             // A resized file is as long as the body says, not as long as the one on the card.
-            let goal = io.resizeRate == nil && frame.bytes > 0 ? frame.bytes : total
+            let goal = io.resizeRate != nil ? total : (endedEarly ? reported : (frame.bytes > 0 ? frame.bytes : total))
             files[index].got = offset
             files[index].total = goal
             files[index].state = goal > 0 && offset >= goal ? "full" : "partial"
@@ -794,7 +828,14 @@ enum Importer {
                 let saveStart = io.now()
                 do {
                     try sink.finish()
-                    io.note("Saved \(files[index].name)", sink.destination.lastPathComponent, op: "save", took: io.now() - saveStart, bytes: offset)
+                    if JPEGCheck.applies(sink.destination) && !JPEGCheck.complete(sink.destination) {
+                        // Never leave a half picture in the library: it looks like a photo and is not one.
+                        try? FileManager.default.removeItem(at: sink.destination)
+                        files[index].state = "corrupt"
+                        io.fail("Incomplete JPEG", "\(files[index].name): \(ByteFormat.string(offset)) received but the file does not end like a JPEG. Not kept.", op: "save", bytes: offset)
+                    } else {
+                        io.note("Saved \(files[index].name)", sink.destination.lastPathComponent, op: "save", took: io.now() - saveStart, bytes: offset)
+                    }
                 } catch {
                     sink.close()
                     io.fail("Save failed", "\(files[index].name). \(IO.describe(error))", op: "save", took: io.now() - saveStart)
@@ -840,6 +881,10 @@ enum Importer {
         var summary = "\(name) copied \(copied.count) file\(copied.count == 1 ? "" : "s") off the card."
         if !already.isEmpty {
             summary += " \(already.count) already here."
+        }
+        let broken = files.filter { $0.state == "corrupt" }
+        if !broken.isEmpty {
+            summary += " \(broken.count) arrived incomplete and \(broken.count == 1 ? "was" : "were") not kept."
         }
         if copiedBytes > 0 && options.live {
             summary += " \(ByteFormat.string(copiedBytes)) at \(ByteFormat.rate(Double(copiedBytes), ms: transferMs))."
@@ -1080,8 +1125,9 @@ private final class IO: @unchecked Sendable {
     }
 
     /// ObjectSize (0xDC04) through GetObjectPropValue, the way XApp learns how long a file is.
-    func objectSize(_ handle: Int) async -> Int? {
-        guard let data = try? await getData(Fuji.getObjectPropValue, params: [UInt32(handle), Fuji.objectSize], title: "ObjectSize #\(handle)", op: "info") else { return nil }
+    func objectSize(_ handle: Int, prop: UInt32 = Fuji.objectSize) async -> Int? {
+        let label = prop == Fuji.objectSize ? "ObjectSize" : String(format: "Object prop 0x%04X", prop)
+        guard let data = try? await getData(Fuji.getObjectPropValue, params: [UInt32(handle), prop], title: "\(label) #\(handle)", op: "info") else { return nil }
         if data.count >= 8 { return Int(LE.u32(data, 0)) | (Int(LE.u32(data, 4)) << 32) }
         if data.count >= 4 { return Int(LE.u32(data, 0)) }
         return nil

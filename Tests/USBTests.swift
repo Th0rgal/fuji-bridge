@@ -15,7 +15,7 @@ final class FakeUSBCamera: PTPCamera, @unchecked Sendable {
 
     init(files: [(UInt32, String, Int)]) {
         self.files = files.map { handle, name, count in
-            (handle, name, Data((0..<count).map { UInt8(truncatingIfNeeded: $0 &* 31 &+ Int(handle)) }))
+            (handle, name, Data.jpegShaped(Data((0..<count).map { UInt8(truncatingIfNeeded: $0 &* 31 &+ Int(handle)) })))
         }
     }
 
@@ -101,7 +101,7 @@ final class USBTests: XCTestCase {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        try Data(count: 3000).write(to: dir.appendingPathComponent("C.JPG"))
+        try Data.jpeg(count: 3000).write(to: dir.appendingPathComponent("C.JPG"))
         let result = await Importer.run(
             link: USBLink(cameras: camera, timeout: 5),
             options: RunOptions(kind: .bridge, frames: [], faults: .none, control: RunControl(), live: true, saveDirectory: dir, transport: .usb, latest: 2),

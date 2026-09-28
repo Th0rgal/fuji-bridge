@@ -24,6 +24,8 @@ enum Ink {
     /// A panel one step off the paper: the camera card, the progress, empty tiles.
     static let surface = adaptive(light: 0xf2efe7, dark: 0x1c1a18)
     static let surface2 = adaptive(light: 0xe9e5db, dark: 0x262320)
+    /// The chosen segment: lifted above its track in both appearances.
+    static let raised = adaptive(light: 0xfbfaf6, dark: 0x34302b)
     static let good = adaptive(light: 0x1baf7a, dark: 0x2ec48c)
     static let bad = adaptive(light: 0xeb6834, dark: 0xe07a4a)
     /// The warning tint behind a notice: the bad color, barely there.
