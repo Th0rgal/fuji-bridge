@@ -224,3 +224,14 @@ final class KeptSessionTests: XCTestCase {
         XCTAssertNil(outcome.live)
     }
 }
+
+final class ProgressGraphTests: XCTestCase {
+    func testTheCurveRunsFromTheLeftEdgeToTheProgressEdge() {
+        let trail = [RatePoint(done: 0.1, mbps: 1), RatePoint(done: 0.2, mbps: 2), RatePoint(done: 0.3, mbps: 3)]
+        let points = ProgressGraph.curvePoints(trail, to: 0.35)
+        XCTAssertEqual(points.first?.done, 0)
+        XCTAssertEqual(points.last?.done, 0.35)
+        // Three-second moving average at the last sample: (1 + 2 + 3) / 3.
+        XCTAssertEqual(points.last?.mbps, 2)
+    }
+}

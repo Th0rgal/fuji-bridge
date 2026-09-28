@@ -2157,24 +2157,26 @@ struct ProgressGraph: View {
     let trail: [RatePoint]
     let caption: String
 
-    private static let height: CGFloat = 38
+    private static let height: CGFloat = 44
+    /// The curve lives in the lower part of the band; the caption owns the top.
+    private static let curveShare: CGFloat = 0.55
 
     var body: some View {
-        let points = Self.smoothed(trail.filter { $0.mbps > 0 || $0.done > 0 })
+        let points = Self.curvePoints(trail, to: done)
         let top = max((points.map(\.mbps).max() ?? 0) * 1.25, 0.1)
         GeometryReader { geo in
             let w = geo.size.width, h = geo.size.height
             let edge = w * CGFloat(done)
             // The curve keeps the upper third clear for the caption at its highest.
-            let xy = points.map { CGPoint(x: w * CGFloat($0.done), y: h - (h * 0.72) * CGFloat($0.mbps / top)) }
+            let xy = points.map { CGPoint(x: w * CGFloat($0.done), y: h - (h * Self.curveShare) * CGFloat($0.mbps / top)) }
             ZStack(alignment: .topLeading) {
                 // Copied so far: a lit wash to the progress edge.
                 Rectangle()
-                    .fill(Ink.ink.opacity(0.10))
+                    .fill(Ink.ink.opacity(0.06))
                     .frame(width: edge)
                 if xy.count > 1 {
                     RateCurve.area(xy, bottom: h)
-                        .fill(LinearGradient(colors: [Ink.ink.opacity(0.38), Ink.ink.opacity(0.14)], startPoint: .top, endPoint: .bottom))
+                        .fill(LinearGradient(colors: [Ink.ink.opacity(0.32), Ink.ink.opacity(0.08)], startPoint: .top, endPoint: .bottom))
                     RateCurve.line(xy)
                         .stroke(Ink.ink.opacity(0.9), style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
                 }
@@ -2184,17 +2186,17 @@ struct ProgressGraph: View {
                     .frame(width: 1.5, height: h)
                     .offset(x: max(0, edge - 0.75))
                     .opacity(done > 0 && done < 1 ? 1 : 0)
+                // A soft scrim under the caption, fading out before the curve's band.
+                LinearGradient(colors: [Ink.surface.opacity(0.7), Ink.surface.opacity(0)], startPoint: .top, endPoint: .bottom)
+                    .frame(height: h * (1 - Self.curveShare) + 4)
+                    .allowsHitTesting(false)
                 Text(caption)
-                    .font(Ink.mono(11.5, .medium))
+                    .font(Ink.side(.detail, .medium))
                     .monospacedDigit()
                     .foregroundStyle(Ink.ink)
                     .lineLimit(1)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 3)
-                    .background(
-                        Capsule().fill(Ink.surface.opacity(0.78))
-                    )
-                    .padding(5)
+                    .padding(.horizontal, 9)
+                    .padding(.top, 5)
                     .contentTransition(.numericText())
             }
         }
@@ -2207,6 +2209,15 @@ struct ProgressGraph: View {
         .accessibilityElement()
         .accessibilityLabel(caption)
         .accessibilityValue("\(Int(done * 100)) percent")
+    }
+
+    /// Smoothed, from the left edge to the progress edge: the samples come once a second, the edge moves
+    /// continuously, so the last speed is carried to where the copying is now.
+    static func curvePoints(_ trail: [RatePoint], to done: Double) -> [RatePoint] {
+        var points = smoothed(trail.filter { $0.mbps > 0 || $0.done > 0 })
+        if let first = points.first, first.done > 0 { points.insert(RatePoint(done: 0, mbps: first.mbps), at: 0) }
+        if let last = points.last, done > last.done { points.append(RatePoint(done: done, mbps: last.mbps)) }
+        return points
     }
 
     /// A three-second moving average, so the pauses between files do not read as crashes.
