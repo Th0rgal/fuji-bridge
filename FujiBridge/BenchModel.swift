@@ -48,6 +48,11 @@ enum Purpose: Equatable {
     case speedTest
 }
 
+struct RatePoint: Equatable, Sendable {
+    var done: Double
+    var mbps: Double
+}
+
 @MainActor
 @Observable
 final class BenchModel {
@@ -145,6 +150,9 @@ final class BenchModel {
     private var sampler: Task<Void, Never>?
     /// MB/s over the last two minutes of the run, one value a second, for the live graph.
     var rateHistory: [Double] = []
+    /// Where the import was (0…1) and how fast it moved, once a second: the progress graph draws speed
+    /// against progress, so the curve ends exactly where the copying is.
+    var rateTrail: [RatePoint] = []
     /// Experiment: drop the Bluetooth link once the Wi-Fi session is open. On phones where Bluetooth and
     /// 2.4 GHz Wi-Fi share an antenna this may speed the transfer up; reports say which way each run went.
     var releaseBluetoothEarly: Bool = UserDefaults.standard.bool(forKey: "BridgeReleaseBLE") {
@@ -840,6 +848,7 @@ final class BenchModel {
     private func startSampler(_ session: SessionLog) {
         sampler?.cancel()
         rateHistory = []
+        rateTrail = []
         UIDevice.current.isBatteryMonitoringEnabled = true
         sampler = Task { @MainActor [weak self] in
             var last = 0
@@ -854,6 +863,9 @@ final class BenchModel {
                 if self.progress != nil {
                     self.rateHistory.append(rate)
                     if self.rateHistory.count > 120 { self.rateHistory.removeFirst(self.rateHistory.count - 120) }
+                    if let p = self.progress, p.count > 0 {
+                        self.rateTrail.append(RatePoint(done: Self.fraction(p), mbps: rate))
+                    }
                 }
                 window.append(rate)
                 tick += 1
@@ -863,6 +875,12 @@ final class BenchModel {
                 session.event("Sample", Self.sampleText(rate: average, phase: self.phase), op: "sample")
             }
         }
+    }
+
+    /// How far the whole import is, from the file index and the bytes of the current file.
+    static func fraction(_ p: LiveProgress) -> Double {
+        let done = (Double(p.index) + (p.total > 0 ? Double(p.got) / Double(p.total) : 0)) / Double(max(p.count, 1))
+        return min(max(done, 0), 1)
     }
 
     private static func sampleText(rate: Double, phase: String) -> String {

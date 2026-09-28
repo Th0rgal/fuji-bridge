@@ -504,16 +504,16 @@ struct HomeView: View {
         if model.purpose == .browse {
             MonoLine(items: ["\(model.cameraPhotos.count) listed"])
         } else if let p = model.progress, p.count > 0 {
-            let done = (Double(p.index) + (p.total > 0 ? Double(p.got) / Double(p.total) : 0)) / Double(p.count)
-            ProgressView(value: min(max(done, 0), 1)).tint(Ink.ink)
-            MonoLine(items: [
-                "\(p.index + 1)/\(p.count)",
-                p.bytesPerSecond > 0 ? String(format: "%.1f MB/s", p.bytesPerSecond / 1_048_576) : nil,
-                remaining(done).map { "\($0) left" },
-            ].compactMap { $0 })
-            if model.rateHistory.count > 2 {
-                RateSparkline(values: model.rateHistory)
-            }
+            let done = BenchModel.fraction(p)
+            ProgressGraph(
+                done: done,
+                trail: model.rateTrail,
+                caption: [
+                    "\(p.index + 1)/\(p.count)",
+                    p.bytesPerSecond > 0 ? String(format: "%.1f MB/s", p.bytesPerSecond / 1_048_576) : nil,
+                    remaining(done).map { "\($0) left" },
+                ].compactMap { $0 }.joined(separator: " · ")
+            )
         }
         if model.joinByHand, let wifi = model.cameraWifi {
             JoinRow(wifi: wifi)
@@ -2149,69 +2149,95 @@ struct BreathingRing: View {
     }
 }
 
-/// MB/s over the last minute of the running import, newest on the right: a smoothed curve over a soft fill,
-/// the latest value marked. The number itself is already on the line above, so the graph carries no text.
-struct RateSparkline: View {
-    let values: [Double]
-    /// Seconds shown; the curve scrolls left as the import goes on.
-    private let span = 60
+/// Progress and speed in one band. Left to right is the import, 0 to 100 %: the part already copied is lit,
+/// with the speed as a curve along its top; the part still to come is the dark track. The numbers sit in the
+/// top-left corner on a soft scrim, so the whole thing takes one line of height.
+struct ProgressGraph: View {
+    let done: Double
+    let trail: [RatePoint]
+    let caption: String
+
+    private static let height: CGFloat = 38
 
     var body: some View {
-        // The seconds before the first bytes (connect, ObjectInfo) are not speed; start at the first real value.
-        let flowing = Array(values.drop { $0 == 0 }.suffix(span))
-        let points = Self.smoothed(flowing)
-        let top = max((points.max() ?? 0) * 1.15, 0.1)
-        // Fills the width from the start, then scrolls once a minute has passed.
-        let slots = min(max(points.count, 10), span)
+        let points = Self.smoothed(trail.filter { $0.mbps > 0 || $0.done > 0 })
+        let top = max((points.map(\.mbps).max() ?? 0) * 1.25, 0.1)
         GeometryReader { geo in
-            let step = geo.size.width / CGFloat(slots - 1)
-            let origin = geo.size.width - CGFloat(points.count - 1) * step
-            let xy = points.enumerated().map { i, v in
-                CGPoint(x: origin + CGFloat(i) * step, y: geo.size.height * (1 - CGFloat(v / top)))
-            }
+            let w = geo.size.width, h = geo.size.height
+            let edge = w * CGFloat(done)
+            // The curve keeps the upper third clear for the caption at its highest.
+            let xy = points.map { CGPoint(x: w * CGFloat($0.done), y: h - (h * 0.72) * CGFloat($0.mbps / top)) }
             ZStack(alignment: .topLeading) {
-                Self.curve(xy, closeTo: geo.size.height)
-                    .fill(LinearGradient(colors: [Ink.ink2.opacity(0.18), Ink.ink2.opacity(0)], startPoint: .top, endPoint: .bottom))
-                Self.curve(xy, closeTo: nil)
-                    .stroke(Ink.ink2, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
-                if let last = xy.last {
-                    Circle()
-                        .fill(Ink.ink)
-                        .frame(width: 5, height: 5)
-                        .position(last)
+                // Copied so far: a lit wash to the progress edge.
+                Rectangle()
+                    .fill(Ink.ink.opacity(0.10))
+                    .frame(width: edge)
+                if xy.count > 1 {
+                    RateCurve.area(xy, bottom: h)
+                        .fill(LinearGradient(colors: [Ink.ink.opacity(0.38), Ink.ink.opacity(0.14)], startPoint: .top, endPoint: .bottom))
+                    RateCurve.line(xy)
+                        .stroke(Ink.ink.opacity(0.9), style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
                 }
+                // The progress edge, so the split reads even where the curve is flat.
+                Rectangle()
+                    .fill(Ink.ink.opacity(0.55))
+                    .frame(width: 1.5, height: h)
+                    .offset(x: max(0, edge - 0.75))
+                    .opacity(done > 0 && done < 1 ? 1 : 0)
+                Text(caption)
+                    .font(Ink.mono(11.5, .medium))
+                    .monospacedDigit()
+                    .foregroundStyle(Ink.ink)
+                    .lineLimit(1)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(
+                        Capsule().fill(Ink.surface.opacity(0.78))
+                    )
+                    .padding(5)
+                    .contentTransition(.numericText())
             }
         }
-        .frame(height: 26)
-        .animation(.linear(duration: 0.9), value: values.count)
-        .opacity(points.count > 1 ? 1 : 0)
-        .accessibilityLabel(String(format: "Speed over the last %d seconds, up to %.1f MB/s", min(values.count, span), values.suffix(span).max() ?? 0))
+        .frame(height: Self.height)
+        .background(Ink.surface2.opacity(0.55))
+        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(Ink.rule, lineWidth: 1))
+        .animation(.linear(duration: 0.9), value: trail.count)
+        .animation(.easeOut(duration: 0.3), value: done)
+        .accessibilityElement()
+        .accessibilityLabel(caption)
+        .accessibilityValue("\(Int(done * 100)) percent")
     }
 
-    /// A three-second moving average: the pauses between files stop reading as crashes.
-    static func smoothed(_ values: [Double]) -> [Double] {
-        values.indices.map { i in
-            let window = values[max(0, i - 2)...i]
-            return window.reduce(0, +) / Double(window.count)
+    /// A three-second moving average, so the pauses between files do not read as crashes.
+    static func smoothed(_ points: [RatePoint]) -> [RatePoint] {
+        points.indices.map { i in
+            let window = points[max(0, i - 2)...i]
+            return RatePoint(done: points[i].done, mbps: window.map(\.mbps).reduce(0, +) / Double(window.count))
         }
     }
+}
 
-    /// Through the midpoints with quadratic curves: smooth, and it never overshoots below zero.
-    static func curve(_ points: [CGPoint], closeTo bottom: CGFloat?) -> Path {
+/// Smooth paths through measured points: quadratic curves via the midpoints, so they never overshoot.
+enum RateCurve {
+    static func line(_ points: [CGPoint]) -> Path {
         Path { path in
             guard let first = points.first else { return }
             path.move(to: first)
             for (a, b) in zip(points, points.dropFirst()) {
-                let mid = CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2)
-                path.addQuadCurve(to: mid, control: a)
+                path.addQuadCurve(to: CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2), control: a)
             }
             if let last = points.last { path.addLine(to: last) }
-            if let bottom, let last = points.last {
-                path.addLine(to: CGPoint(x: last.x, y: bottom))
-                path.addLine(to: CGPoint(x: first.x, y: bottom))
-                path.closeSubpath()
-            }
         }
+    }
+
+    static func area(_ points: [CGPoint], bottom: CGFloat) -> Path {
+        var path = line(points)
+        guard let first = points.first, let last = points.last else { return path }
+        path.addLine(to: CGPoint(x: last.x, y: bottom))
+        path.addLine(to: CGPoint(x: first.x, y: bottom))
+        path.closeSubpath()
+        return path
     }
 }
 
