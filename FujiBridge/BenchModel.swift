@@ -127,6 +127,11 @@ final class BenchModel {
         didSet { UserDefaults.standard.set(scope.rawValue, forKey: "BridgeScope") }
     }
     /// Camera address. 192.168.0.1 on the body's own Wi-Fi; a Mac running tools/fakecam.py for rehearsals.
+    /// Also put each imported photo in the Photos library ("Fuji Bridge" album). On by default on iPhone and iPad,
+    /// where Photos is where pictures are looked for; the Mac already saves into Pictures.
+    var addToPhotos: Bool = UserDefaults.standard.object(forKey: "BridgeAddToPhotos") as? Bool ?? !ProcessInfo.processInfo.isMacCatalystApp {
+        didSet { UserDefaults.standard.set(addToPhotos, forKey: "BridgeAddToPhotos") }
+    }
     /// Bytes per GetPartialObject over Wi-Fi. 1 MB like XApp until a speed test finds better.
     var windowSize: Int = UserDefaults.standard.object(forKey: "BridgeWindow") as? Int ?? Fuji.partialMax {
         didSet { UserDefaults.standard.set(windowSize, forKey: "BridgeWindow") }
@@ -633,6 +638,8 @@ final class BenchModel {
 
     /// The Wi-Fi session the last action left open, so the next one starts at once.
     private(set) var liveSession: LiveSession?
+    /// Camera battery 0…1, when the body reported it in the last session.
+    private(set) var cameraBattery: Double?
     var connected: Bool { liveSession != nil }
     @ObservationIgnored private var keepAlive: Task<Void, Never>?
     @ObservationIgnored private var probing: Task<Bool, Never>?
@@ -641,6 +648,7 @@ final class BenchModel {
     /// Holds a kept session: pings the body every 15 s while idle, lets go after 10 idle minutes.
     private func keep(_ live: LiveSession) {
         liveSession = live
+        if let level = live.io.battery { cameraBattery = level }
         lastUse = Date()
         keepAlive?.cancel()
         keepAlive = Task { @MainActor [weak self] in
@@ -656,6 +664,7 @@ final class BenchModel {
                 self.probing = check
                 let alive = await check.value
                 self.probing = nil
+                if let level = live.io.battery { self.cameraBattery = level }
                 if !alive, self.liveSession === live {
                     self.liveSession = nil
                     FujiBluetooth.shared.release()
@@ -714,6 +723,17 @@ final class BenchModel {
             if !importedNames.contains(url.lastPathComponent) {
                 let at = saved.firstIndex { $0.lastPathComponent < url.lastPathComponent } ?? saved.endIndex
                 saved.insert(url, at: at)
+            }
+            if addToPhotos {
+                let session = self.session
+                Task {
+                    let outcome = await PhotosExport.add(url)
+                    switch outcome {
+                    case .added: session?.event("Added to Photos", "\(url.lastPathComponent) in the \(PhotosExport.albumName) album.", op: "save")
+                    case .denied: session?.event("Photos access off", "Allow it in Settings › Fuji Bridge › Photos to also add imports to the library.", op: "save", level: "warn")
+                    case .failed(let why): session?.event("Photos failed", "\(url.lastPathComponent): \(why)", op: "save", level: "warn")
+                    }
+                }
             }
         }
         switch line.op {

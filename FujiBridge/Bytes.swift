@@ -43,8 +43,10 @@ enum Fuji {
     static let getFolders: UInt16 = 0x9050
     static let getDates: UInt16 = 0x9053
 
-    /// Standard PTP BatteryLevel.
+    /// Standard PTP BatteryLevel: 1–3 on Fujifilm bodies (XApp's three-bar icon).
     static let batteryLevel: UInt32 = 0x5001
+    /// Fujifilm's finer battery level, XApp's five-bar icon: 6–11 (6 and 7 both the lowest bar).
+    static let batteryMulti: UInt32 = 0xd242
     static let cameraState: UInt32 = 0xdf00
     static let clientState: UInt32 = 0xdf01
     static let events: UInt32 = 0xd212

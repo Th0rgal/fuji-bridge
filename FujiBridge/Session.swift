@@ -259,10 +259,13 @@ enum Importer {
         } else {
             let handshake = await wifiHandshake(io, link: link, options: options, files: files)
             if let handshake { return handshake }
-            // Standard PTP BatteryLevel. A body low on charge may throttle its radio; the report should say so.
-            if options.live, let level = try? await io.getProp(Fuji.batteryLevel, title: "Get 0x5001", op: "setup"), !level.isEmpty {
-                let value = level.count >= 2 ? Int(LE.u16(level, 0)) : Int(level[level.startIndex])
-                io.note("Camera battery", "BatteryLevel reads \(value) (raw \(Packets.hex(level))).", op: "setup")
+            // Battery: XApp's D242 (five steps), then standard 5001 (three). A body low on charge may throttle
+            // its radio; the report says so, and the camera card shows it.
+            if options.live {
+                let multi = (try? await io.getProp(Fuji.batteryMulti, title: "Get 0xD242", op: "setup")).flatMap { $0.count >= 2 ? UInt32(LE.u16($0, 0)) : nil }
+                let level = (try? await io.getProp(Fuji.batteryLevel, title: "Get 0x5001", op: "setup")).flatMap { $0.count >= 2 ? UInt32(LE.u16($0, 0)) : ($0.isEmpty ? nil : UInt32($0[$0.startIndex])) }
+                if let fraction = IO.batteryFraction(multi: multi, level: level) { io.battery = fraction }
+                io.note("Camera battery", "D242 = \(multi.map(String.init) ?? "none"), 5001 = \(level.map(String.init) ?? "none")\(io.battery.map { String(format: ", %.0f%%", $0 * 100) } ?? "").", op: "setup")
             }
             options.sessionUp?()
         }
@@ -1090,6 +1093,15 @@ final class IO: @unchecked Sendable {
     var slowInfoOnly = false
     /// Once per session: a missing thumbnail on the fast path gets one retry after GetObjectInfo.
     var triedThumbFallback = false
+    /// Camera battery, 0…1, from D242 (five steps) or 5001 (three), when the body reports one.
+    var battery: Double?
+
+    /// XApp's mapping: D242 6–11 is the five-bar icon (6 and 7 both one bar), 5001 1–3 the three-bar one.
+    static func batteryFraction(multi: UInt32?, level: UInt32?) -> Double? {
+        if let multi, (6...11).contains(multi) { return [0.1, 0.2, 0.4, 0.6, 0.8, 1.0][Int(multi) - 6] }
+        if let level, (1...3).contains(level) { return Double(level) / 3 }
+        return nil
+    }
     var forceCompression: UInt16 { resizeRate == nil ? 2 : 1 }
     var importHandles: [Int] = []
     var transport: Transport = .wifi
@@ -1283,6 +1295,9 @@ final class IO: @unchecked Sendable {
         let data = try await getProp(Fuji.events, title: "Get 0xD212", op: "ok-wait")
         if let count = FujiEvents.value(data, prop: Fuji.objectCount) {
             objectCount = Int(count)
+        }
+        if let level = IO.batteryFraction(multi: FujiEvents.value(data, prop: Fuji.batteryMulti), level: FujiEvents.value(data, prop: Fuji.batteryLevel)) {
+            battery = level
         }
         return FujiEvents.value(data, prop: Fuji.cameraState) ?? 0
     }

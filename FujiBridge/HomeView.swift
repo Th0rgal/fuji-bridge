@@ -17,6 +17,10 @@ struct HomeView: View {
     @State private var picked: Set<URL> = []
     /// iPhone and iPad: "Select" was tapped, so a tap on a photo selects it instead of opening it.
     @State private var selecting = false
+    /// iPhone and iPad: which page the title menu shows.
+    @State private var page: AppPage = .photos
+    /// Mac: the page pushed from the sidebar footer.
+    @State private var macPage: AppPage?
     @State private var pickedAnchor: URL?
     @State private var cameraAnchor: Int?
     @State private var ratios: [URL: CGFloat] = [:]
@@ -24,7 +28,6 @@ struct HomeView: View {
     /// Frames the user asked to delete from the card, waiting for the confirmation.
     @State private var cameraDeleteTarget: Set<Int>?
     /// Mac only: the sidebar's Diagnostics row pushes onto the detail column.
-    @State private var showDiagnostics = false
     /// On the phone the camera card and the tab header scroll with the grid: their height, so an empty
     /// state can take exactly what is left of the screen instead of a full screen below them.
     @State private var cardHeight: CGFloat = 0
@@ -68,6 +71,12 @@ struct HomeView: View {
             }
         }
         .onChange(of: model.saved) { _, saved in picked.formIntersection(saved) }
+        .onChange(of: tab) { _, _ in
+            selecting = false
+            // A selection in Imported (share, delete) does not survive leaving the tab; the camera's
+            // (photos picked to import) does, so a look at Imported does not lose it.
+            picked = []
+        }
         .onAppear {
             model.refreshSaved()
             if UserDefaults.standard.string(forKey: "BridgeTab") == "imported" { tab = .imported }
@@ -85,6 +94,7 @@ struct HomeView: View {
                 tab = .camera
             }
             if UserDefaults.standard.bool(forKey: "BridgeSelecting") { selecting = true }
+            if let name = UserDefaults.standard.string(forKey: "BridgePage"), let target = AppPage(rawValue: name) { page = target }
             #endif
         }
     }
@@ -98,6 +108,55 @@ struct HomeView: View {
             macRoot
         } else {
             NavigationStack {
+                Group {
+                    switch page {
+                    case .photos: photosPage
+                    case .recipes: RecipesPage(model: model)
+                    case .backup: BackupPage(model: model)
+                    case .diagnostics: diagnostics
+                    }
+                }
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .principal) { pageMenu }
+                }
+                // The Mac window already says Fuji Bridge in its title bar; a second bar under it only costs photos.
+                .toolbar(Ink.isMac ? .hidden : .automatic, for: .navigationBar)
+                .background { shortcuts }
+                .background { ModifierKeys.Listener().frame(width: 0, height: 0) }
+            }
+        }
+    }
+
+    /// Where the app is: the photos, the recipes, the settings backup, the diagnostics. The title opens the list.
+    private var pageMenu: some View {
+        Menu {
+            Picker("Page", selection: $page) {
+                ForEach(AppPage.allCases) { item in
+                    Label(item.title, systemImage: item == .diagnostics ? diagnosticsIcon : item.symbol).tag(item)
+                }
+            }
+            .pickerStyle(.inline)
+        } label: {
+            HStack(spacing: 5) {
+                Text(page == .photos ? "Fuji Bridge" : page.title)
+                    .font(.headline)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(Ink.ink2)
+                if page != .diagnostics, diagnosticsTint == Ink.bad {
+                    Circle().fill(Ink.bad).frame(width: 6, height: 6)
+                }
+            }
+            .foregroundStyle(Ink.ink)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .contentShape(Capsule())
+        }
+        .accessibilityLabel("Page: \(page.title)")
+    }
+
+    private var photosPage: some View {
                 GeometryReader { geo in
                     if geo.size.width >= 760 {
                         HStack(alignment: .top, spacing: 0) {
@@ -117,24 +176,6 @@ struct HomeView: View {
                     }
                 }
                 .background(Ink.paper)
-                .navigationTitle("Fuji Bridge")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItemGroup(placement: .topBarTrailing) {
-                        NavigationLink {
-                            diagnostics
-                        } label: {
-                            Label("Diagnostics", systemImage: diagnosticsIcon)
-                                .foregroundStyle(diagnosticsTint)
-                        }
-                    }
-                }
-                // The Mac window already says Fuji Bridge in its title bar; a second bar under it only costs photos.
-                .toolbar(Ink.isMac ? .hidden : .automatic, for: .navigationBar)
-                .background { shortcuts }
-                .background { ModifierKeys.Listener().frame(width: 0, height: 0) }
-            }
-        }
     }
 
     private var macRoot: some View {
@@ -155,7 +196,13 @@ struct HomeView: View {
                 galleryScroll(wide: true)
                     .background(Ink.paper.ignoresSafeArea())
                     .toolbar(.hidden, for: .navigationBar)
-                    .navigationDestination(isPresented: $showDiagnostics) { diagnostics }
+                    .navigationDestination(item: $macPage) { page in
+                        switch page {
+                        case .recipes: RecipesPage(model: model)
+                        case .backup: BackupPage(model: model)
+                        default: diagnostics
+                        }
+                    }
                     .background { shortcuts }
                     .background { ModifierKeys.Listener().frame(width: 0, height: 0) }
             }
@@ -166,14 +213,11 @@ struct HomeView: View {
             MacToolbar.shared.onAction = { toolbarAction() }
             syncToolbar()
             #if DEBUG
-            if UserDefaults.standard.bool(forKey: "BridgeShowDiagnostics") { showDiagnostics = true }
+            if UserDefaults.standard.bool(forKey: "BridgeShowDiagnostics") { macPage = .diagnostics }
             #endif
         }
-        .onChange(of: tab) { _, _ in
-            selecting = false
-            syncToolbar()
-        }
-        .onChange(of: showDiagnostics) { _, shown in MacToolbar.shared.setGalleryVisible(!shown) }
+        .onChange(of: tab) { _, _ in syncToolbar() }
+        .onChange(of: macPage) { _, shown in MacToolbar.shared.setGalleryVisible(shown == nil) }
         .onChange(of: model.saved.count) { _, _ in syncToolbar() }
         .onChange(of: model.cameraPhotos.count) { _, _ in syncToolbar() }
         .onChange(of: model.selection) { _, _ in syncToolbar() }
@@ -194,22 +238,26 @@ struct HomeView: View {
     private var sidebarFooter: some View {
         VStack(spacing: 0) {
             Rectangle().fill(Ink.rule).frame(height: 1)
-            Button { showDiagnostics = true } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: diagnosticsIcon)
-                        .foregroundStyle(diagnosticsTint == Ink.bad ? Ink.bad : Ink.ink2)
-                    Text("Diagnostics")
-                    Spacer()
-                    Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold)).foregroundStyle(Ink.muted)
+            ForEach([AppPage.recipes, .backup, .diagnostics]) { item in
+                Button { macPage = item } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: item == .diagnostics ? diagnosticsIcon : item.symbol)
+                            .foregroundStyle(item == .diagnostics && diagnosticsTint == Ink.bad ? Ink.bad : Ink.ink2)
+                            .frame(width: 18)
+                        Text(item.title)
+                        Spacer()
+                        Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold)).foregroundStyle(Ink.muted)
+                    }
+                    .font(Ink.side(.title))
+                    .foregroundStyle(Ink.ink2)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 10)
+                    .contentShape(Rectangle())
                 }
-                .font(Ink.side(.title))
-                .foregroundStyle(Ink.ink2)
-                .padding(.horizontal, 20)
-                .padding(.vertical, 12)
-                .contentShape(Rectangle())
+                .buttonStyle(InkPress())
             }
-            .buttonStyle(InkPress())
         }
+        .padding(.vertical, 4)
     }
 
     // MARK: Controls
@@ -269,11 +317,21 @@ struct HomeView: View {
                     .font(Ink.side(.name))
                     .foregroundStyle(Ink.ink)
                     .lineLimit(1)
-                Label(linkLabel, systemImage: linkSymbol)
-                    .font(Ink.side(.detail))
-                    .foregroundStyle(Ink.ink2)
-                    .labelStyle(.titleAndIcon)
-                    .lineLimit(1)
+                HStack(spacing: 8) {
+                    Label(linkLabel, systemImage: linkSymbol)
+                        .labelStyle(.titleAndIcon)
+                        .lineLimit(1)
+                    if let battery = model.cameraBattery {
+                        Label("\(Int((battery * 100).rounded())) %", systemImage: Self.batterySymbol(battery))
+                            .labelStyle(.titleAndIcon)
+                            .foregroundStyle(battery <= 0.2 ? Ink.bad : Ink.ink2)
+                            .monospacedDigit()
+                            .lineLimit(1)
+                            .accessibilityLabel("Camera battery \(Int((battery * 100).rounded())) percent")
+                    }
+                }
+                .font(Ink.side(.detail))
+                .foregroundStyle(Ink.ink2)
             }
             Spacer(minLength: 4)
             if running {
@@ -299,6 +357,16 @@ struct HomeView: View {
                 .foregroundStyle(Ink.ink2)
                 .help("Disconnect from the camera")
             }
+        }
+    }
+
+    static func batterySymbol(_ level: Double) -> String {
+        switch level {
+        case ..<0.15: return "battery.0percent"
+        case ..<0.4: return "battery.25percent"
+        case ..<0.65: return "battery.50percent"
+        case ..<0.9: return "battery.75percent"
+        default: return "battery.100percent"
         }
     }
 
@@ -422,6 +490,9 @@ struct HomeView: View {
                         .pickerStyle(.inline)
                         .labelsHidden()
                     }
+                    Section {
+                        Toggle("Add to Photos", systemImage: "photo.stack", isOn: $model.addToPhotos)
+                    }
                 } label: {
                     HStack(spacing: 3) {
                         Text(scopeShort).font(Ink.side(.title, .semibold)).monospacedDigit()
@@ -511,7 +582,7 @@ struct HomeView: View {
                 caption: [
                     "\(p.index + 1)/\(p.count)",
                     p.bytesPerSecond > 0 ? String(format: "%.1f MB/s", p.bytesPerSecond / 1_048_576) : nil,
-                    remaining(done).map { "\($0) left" },
+                    p.bytesPerSecond > 0 ? remaining(done).map { "\($0) left" } : "Starting…",
                 ].compactMap { $0 }.joined(separator: " · ")
             )
         }
@@ -655,9 +726,15 @@ struct HomeView: View {
             .overlay(Capsule().strokeBorder(Ink.rule, lineWidth: 1))
             // The tabs never give up their names; the action on the right shortens instead.
             .fixedSize()
-            Spacer(minLength: 8)
+            Spacer(minLength: 6)
             galleryAction
         }
+    }
+
+    /// iPhone mini and SE widths: the header's buttons drop their words. The screen, not the row: a row that
+    /// overflows measures wider than the screen and would never count as narrow.
+    private var narrowHeader: Bool {
+        !Ink.isMac && UIDevice.current.userInterfaceIdiom == .phone && UIScreen.main.bounds.width < 400
     }
 
     /// Above the card's grid: how much of the card is listed, and a way to list more of it, a page at a time
@@ -758,7 +835,7 @@ struct HomeView: View {
             .font(Ink.side(.title, on ? .semibold : .regular))
             .foregroundStyle(on ? Ink.ink : Ink.ink2)
             .lineLimit(1)
-            .padding(.horizontal, 12)
+            .padding(.horizontal, narrowHeader ? 9 : 12)
             .padding(.vertical, 6)
             .background {
                 if on {
@@ -831,11 +908,10 @@ struct HomeView: View {
     @ViewBuilder
     private var selectToggle: some View {
         if choosing {
-            headerButton("Done", symbol: "checkmark", help: "Leave selection") { clearSelection() }
+            headerButton(narrowHeader ? nil : "Done", symbol: "checkmark", help: "Done") { clearSelection() }
         } else {
-            ViewThatFits(in: .horizontal) {
-                headerButton("Select", symbol: "checkmark.circle", help: "Select photos") { withAnimation(.snappy(duration: 0.2)) { selecting = true } }
-                headerButton(nil, symbol: "checkmark.circle", help: "Select photos") { withAnimation(.snappy(duration: 0.2)) { selecting = true } }
+            headerButton(narrowHeader ? nil : "Select", symbol: "checkmark.circle", help: "Select photos") {
+                withAnimation(.snappy(duration: 0.2)) { selecting = true }
             }
         }
     }
@@ -843,7 +919,7 @@ struct HomeView: View {
     @ViewBuilder
     private var galleryAction: some View {
         if !Ink.isMac {
-            HStack(spacing: 6) {
+            HStack(spacing: narrowHeader ? 4 : 6) {
                 if hasPhotos { selectToggle }
                 if tab == .imported {
                     headerButton(nil, symbol: "folder", help: "Open in Files") { model.revealPhotos() }
@@ -976,11 +1052,8 @@ struct HomeView: View {
     // MARK: Selection
 
     /// Phone, nothing picked yet: a tap looks at the photo, like Photos. Otherwise a tap picks.
+    /// Only called while choosing (see `choosing`): on touch a tap toggles, on the Mac it follows Finder.
     private func clickImported(_ url: URL, _ kind: SelectionClick.Kind) {
-        if kind == .plain && !Ink.isMac && picked.isEmpty {
-            openViewer(.local(url))
-            return
-        }
         SelectionClick.apply(kind, id: url, order: model.saved, selection: &picked, anchor: &pickedAnchor, plainToggles: !Ink.isMac)
     }
 
@@ -1055,12 +1128,14 @@ struct HomeView: View {
     private var selectionBar: some View {
         let count = tab == .imported ? picked.count : model.selection.count
         if count > 0 || (selecting && !Ink.isMac) {
-            HStack(spacing: 14) {
+            HStack(spacing: 12) {
                 Text(count == 0 ? "Tap photos" : "\(count) selected")
-                    .font(Ink.mono(13, .medium))
+                    .font(Ink.side(.title, .medium))
                     .foregroundStyle(count == 0 ? Ink.ink2 : Ink.ink)
                     .monospacedDigit()
-                Spacer(minLength: 4)
+                    .lineLimit(1)
+                    .fixedSize()
+                Spacer(minLength: 2)
                 if count == 0 {
                     if tab == .camera, !freshHandles.isEmpty {
                         Button { model.selection = Set(freshHandles) } label: {
@@ -1084,14 +1159,15 @@ struct HomeView: View {
                     .foregroundStyle(Ink.bad)
                     .help("Delete")
                 } else {
-                    Button { cameraDeleteTarget = model.selection } label: {
-                        Label("Delete from Camera", systemImage: "trash").labelStyle(.iconOnly)
+                    // Out of the way while an import runs: it could not be used then anyway.
+                    if !model.busy {
+                        Button { cameraDeleteTarget = model.selection } label: {
+                            Label("Delete from Camera", systemImage: "trash").labelStyle(.iconOnly)
+                        }
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundStyle(Ink.bad)
+                        .help("Delete from the camera")
                     }
-                    .font(.system(size: 16, weight: .medium))
-                    .foregroundStyle(Ink.bad)
-                    .disabled(model.busy)
-                    .opacity(model.busy ? 0.35 : 1)
-                    .help("Delete from the camera")
                     importSplit
                 }
                 Button { clearSelection() } label: {
@@ -1148,6 +1224,7 @@ struct HomeView: View {
                     }
                 }
                 .pickerStyle(.inline)
+                Toggle("Add to Photos", systemImage: "photo.stack", isOn: Binding(get: { model.addToPhotos }, set: { model.addToPhotos = $0 }))
             } label: {
                 HStack(spacing: 3) {
                     if model.importSize != .original { Text(model.importSize.short) }
@@ -2174,6 +2251,10 @@ struct ProgressGraph: View {
                 Rectangle()
                     .fill(Ink.ink.opacity(0.06))
                     .frame(width: edge)
+                if xy.count < 2 {
+                    // Before the first speed sample: a slow sweep, so the band reads as working, not empty.
+                    Sweep().frame(width: w, height: h)
+                }
                 if xy.count > 1 {
                     RateCurve.area(xy, bottom: h)
                         .fill(LinearGradient(colors: [Ink.ink.opacity(0.32), Ink.ink.opacity(0.08)], startPoint: .top, endPoint: .bottom))
@@ -2226,6 +2307,24 @@ struct ProgressGraph: View {
             let window = points[max(0, i - 2)...i]
             return RatePoint(done: points[i].done, mbps: window.map(\.mbps).reduce(0, +) / Double(window.count))
         }
+    }
+}
+
+/// A soft highlight crossing the band every 1.6 s, for the moments with nothing to plot yet.
+private struct Sweep: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        TimelineView(.animation(paused: reduceMotion)) { context in
+            GeometryReader { geo in
+                let phase = context.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 1.6) / 1.6
+                let width = geo.size.width * 0.35
+                LinearGradient(colors: [Ink.ink.opacity(0), Ink.ink.opacity(0.10), Ink.ink.opacity(0)], startPoint: .leading, endPoint: .trailing)
+                    .frame(width: width)
+                    .offset(x: -width + (geo.size.width + width) * phase)
+            }
+        }
+        .allowsHitTesting(false)
     }
 }
 
@@ -2391,5 +2490,28 @@ struct JoinRow: View {
         .buttonStyle(InkPress())
         .foregroundStyle(Ink.ink)
         .help(help)
+    }
+}
+
+/// The app's pages, switched from the title menu (iPhone, iPad) or the sidebar footer (Mac).
+enum AppPage: String, CaseIterable, Identifiable, Hashable {
+    case photos, recipes, backup, diagnostics
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .photos: return "Photos"
+        case .recipes: return "Recipes"
+        case .backup: return "Settings backup"
+        case .diagnostics: return "Diagnostics"
+        }
+    }
+    var symbol: String {
+        switch self {
+        case .photos: return "photo.on.rectangle"
+        case .recipes: return "camera.filters"
+        case .backup: return "externaldrive.badge.checkmark"
+        case .diagnostics: return "waveform.path.ecg"
+        }
     }
 }

@@ -40,6 +40,7 @@ struct PhotoViewer: View {
     @State private var image: UIImage?
     @State private var sharp = false
     @State private var dimensions: CGSize?
+    @State private var recipeFor: RecipeTarget?
 
     private var item: ViewerItem { items[index] }
 
@@ -58,6 +59,12 @@ struct PhotoViewer: View {
             }
         }
         .foregroundStyle(.white)
+        .sheet(item: $recipeFor) { target in RecipeCard(url: target.url) }
+        #if DEBUG
+        .onAppear {
+            if UserDefaults.standard.bool(forKey: "BridgeShowRecipe"), let fileURL { recipeFor = RecipeTarget(url: fileURL) }
+        }
+        #endif
         .task(id: item.id) { await load() }
         .task(id: fullSizeKey) { await loadFullSize() }
     }
@@ -77,26 +84,62 @@ struct PhotoViewer: View {
         }
         .padding(.horizontal, 18)
         .padding(.top, 12)
+        .padding(.bottom, 8)
+        // Taps on the bar stay on the bar: only the photo's black surround closes the viewer.
+        .contentShape(Rectangle())
+        .onTapGesture {}
+    }
+
+    /// The file on disk behind this item, for the recipe card: an imported photo, or a camera frame already
+    /// fetched full size.
+    private var fileURL: URL? {
+        switch item {
+        case .local(let url): return url
+        case .camera(let photo): return model.cachedFullSize(photo)
+        }
+    }
+
+    private func barIcon(_ symbol: String) -> some View {
+        Image(systemName: symbol)
+            .font(.system(size: 17, weight: .medium))
+            .frame(width: 44, height: 44)
+            .contentShape(Rectangle())
     }
 
     private var bottomBar: some View {
-        HStack(spacing: 14) {
-            Text(caption)
-                .font(Ink.mono(12))
-                .foregroundStyle(.white.opacity(0.7))
-                .lineLimit(1)
+        HStack(spacing: 6) {
+            Button {
+                if let fileURL { recipeFor = RecipeTarget(url: fileURL) }
+            } label: {
+                HStack(spacing: 6) {
+                    Text(caption)
+                        .font(Ink.mono(12))
+                        .foregroundStyle(.white.opacity(0.7))
+                        .lineLimit(1)
+                    if fileURL != nil {
+                        Image(systemName: "info.circle")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.85))
+                    }
+                }
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(fileURL == nil)
+            .help("Recipe and shot details")
             Spacer(minLength: 8)
             if case .camera(let photo) = item {
                 fullSizeControl(photo)
                 if let deleteFromCamera {
-                    Button { deleteFromCamera(photo.handle) } label: { Image(systemName: "trash") }
+                    Button { deleteFromCamera(photo.handle) } label: { barIcon("trash") }
                         .buttonStyle(.plain)
                         .disabled(model.busy)
                         .help("Delete from the camera")
                 }
             }
             if case .local(let url) = item {
-                ShareLink(item: url) { Image(systemName: "square.and.arrow.up") }
+                ShareLink(item: url) { barIcon("square.and.arrow.up") }
                     .buttonStyle(.plain)
                     .help("Share")
             }
@@ -110,8 +153,11 @@ struct PhotoViewer: View {
             .buttonStyle(.plain)
             .help("Select (Return)")
         }
-        .padding(.horizontal, 18)
-        .padding(.bottom, 14)
+        .padding(.horizontal, 12)
+        .padding(.top, 8)
+        .padding(.bottom, 6)
+        .contentShape(Rectangle())
+        .onTapGesture {}
     }
 
     @ViewBuilder
@@ -302,4 +348,10 @@ struct ZoomableImage: View {
         offset = .zero
         lastOffset = .zero
     }
+}
+
+/// A file whose recipe card is open.
+struct RecipeTarget: Identifiable {
+    let url: URL
+    var id: String { url.path }
 }

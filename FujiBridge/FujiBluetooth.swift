@@ -58,7 +58,19 @@ enum FujiBLE {
     /// Advertised by a bonded body looking for its phone (seen on an X100VI, firmware 1.32).
     static let reconnectAdvert = CBUUID(string: "804daa8e-ffeb-4ab3-8e75-6edd7303208d")
 
-    static let services: [CBUUID] = [securePairService, basicPairService, configService, wifiService, shutterService, reconnectAdvert]
+    // Settings backup, from XApp's BTConstansKt (BACKUP_REQUEST lives in the 6514eb81 service above).
+    static let stateService = CBUUID(string: "4C0020FE-F3B6-40DE-ACC9-77D129067B14")
+    static let fileService = CBUUID(string: "AF854C2E-B214-458E-97E2-912C4ECF2CB8")
+    static let backupRequest = CBUUID(string: "F14E7A88-6F57-4872-A69B-B47EF3295C9B")
+    static let backupState = CBUUID(string: "11438C83-CFB0-4511-841B-759E0D2321C8")
+    static let fileIndex = CBUUID(string: "051DD980-DF9D-4472-A2E1-35811DD24EE1")
+    static let filePartialSize = CBUUID(string: "7F3400FE-17E7-4B80-8A0E-81B0343C1B49")
+    static let fileInformation = CBUUID(string: "C922AC69-9480-4348-8F4B-9EE29BC30D1D")
+    static let filePartialData = CBUUID(string: "AC0C799A-FA6C-4DF5-BBC5-BB95CCE7E6EA")
+    static let fileTransactionState = CBUUID(string: "2E27ED9F-5506-41CD-BA48-DAC06669AD95")
+    static let fileTransferResult = CBUUID(string: "68052E8A-FB91-404F-8847-0EB4BE24308C")
+
+    static let services: [CBUUID] = [securePairService, basicPairService, configService, wifiService, shutterService, reconnectAdvert, stateService, fileService]
 
     /// What libfuji subscribes to on a secure body, in its order (lib/bluetooth.c, fuji_connect_bluetooth).
     /// XApp listens to all of these; a body may wait for its client to listen before it serves the Wi-Fi session.
@@ -529,6 +541,22 @@ final class FujiBluetooth: NSObject, CBCentralManagerDelegate, CBPeripheralDeleg
         }
         let count = queue.sync { characteristics.count }
         emit("Bluetooth services", "\(count) characteristics")
+    }
+
+    /// Downloads the camera's settings backup (XApp's "Backup") over Bluetooth: connect, run the file transfer,
+    /// let go. The raw file comes back as the camera sent it.
+    func backupSettings(progress: @escaping @Sendable (Int, Int) -> Void = { _, _ in }) async throws -> (name: String, data: Data) {
+        switch await poweredState() {
+        case .poweredOn: break
+        case .unauthorized: throw BLEError.unauthorized
+        default: throw BLEError.off
+        }
+        let (target, advert) = try await pick(timeout: 30, pairing: false)
+        emit("Bluetooth camera", "\(target.name ?? "Fujifilm") \(advert.kind.rawValue) \(advert.tag), for a settings backup")
+        try await connect(target, timeout: 15)
+        defer { disconnect() }
+        try await discover(timeout: 15)
+        return try await FujiBackup.run(self, progress: progress) { title, detail in self.emit(title, detail) }
     }
 
     /// Ends the link a successful wake left open.
